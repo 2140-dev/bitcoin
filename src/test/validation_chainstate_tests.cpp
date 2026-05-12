@@ -10,7 +10,6 @@
 #include <rpc/blockchain.h>
 #include <script/script.h>
 #include <sync.h>
-#include <test/util/chainstate.h>
 #include <test/util/common.h>
 #include <test/util/coins.h>
 #include <test/util/random.h>
