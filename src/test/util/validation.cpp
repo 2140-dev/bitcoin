@@ -23,8 +23,8 @@ void TestChainstateManager::DisableNextWrite()
         void ResetNextWrite() { m_next_write = NodeClock::time_point::max() - 1s; }
     };
     LOCK(::cs_main);
-    for (const auto& cs : m_chainstates) {
-        static_cast<TestChainstate&>(*cs).ResetNextWrite();
+    if (m_chainstate) {
+        static_cast<TestChainstate&>(*m_chainstate).ResetNextWrite();
     }
 }
 

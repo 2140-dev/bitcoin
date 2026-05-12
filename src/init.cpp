@@ -339,10 +339,8 @@ void Shutdown(NodeContext& node)
     // FlushStateToDisk generates a ChainStateFlushed callback, which we should avoid missing
     if (node.chainman) {
         LOCK(cs_main);
-        for (const auto& chainstate : node.chainman->m_chainstates) {
-            if (chainstate->CanFlushToDisk()) {
-                chainstate->ForceFlushStateToDisk();
-            }
+        if (node.chainman->m_chainstate && node.chainman->m_chainstate->CanFlushToDisk()) {
+            node.chainman->m_chainstate->ForceFlushStateToDisk();
         }
     }
 
@@ -352,17 +350,13 @@ void Shutdown(NodeContext& node)
 
     // Any future callbacks will be dropped. This should absolutely be safe - if
     // missing a callback results in an unrecoverable situation, unclean shutdown
-    // would too. The only reason to do the above flushes is to let the wallet catch
-    // up with our current chain to avoid any strange pruning edge cases and make
-    // next startup faster by avoiding rescan.
+    // would too.
 
     if (node.chainman) {
         LOCK(cs_main);
-        for (const auto& chainstate : node.chainman->m_chainstates) {
-            if (chainstate->CanFlushToDisk()) {
-                chainstate->ForceFlushStateToDisk();
-                chainstate->ResetCoinsViews();
-            }
+        if (node.chainman->m_chainstate && node.chainman->m_chainstate->CanFlushToDisk()) {
+            node.chainman->m_chainstate->ForceFlushStateToDisk();
+            node.chainman->m_chainstate->ResetCoinsViews();
         }
     }
 
@@ -1797,9 +1791,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (chainman.m_blockman.IsPruneMode()) {
         if (chainman.m_blockman.m_blockfiles_indexed) {
             LOCK(cs_main);
-            for (const auto& chainstate : chainman.m_chainstates) {
+            if (chainman.m_chainstate) {
                 uiInterface.InitMessage(_("Pruning blockstore…"));
-                chainstate->PruneAndFlush();
+                chainman.m_chainstate->PruneAndFlush();
             }
         }
     } else {

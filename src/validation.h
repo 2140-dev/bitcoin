@@ -1134,14 +1134,10 @@ public:
 
     ~ChainstateManager();
 
-    //! List of chainstates. Note: in general, it is not safe to delete
-    //! Chainstate objects once they are added to this list because there is no
-    //! mutex that can be locked to prevent Chainstate pointers from being used
-    //! while they are deleted. (cs_main doesn't work because it is too narrow
-    //! and is released in the middle of Chainstate::ActivateBestChain to let
-    //! notifications be processed. m_chainstate_mutex doesn't work because it
-    //! is not locked at other times when the chainstate is in use.)
-    std::vector<std::unique_ptr<Chainstate>> m_chainstates GUARDED_BY(::cs_main);
+    //! The sole chainstate managed by this ChainstateManager. Set in
+    //! InitializeChainstate() and held alive for the lifetime of this object
+    //! after that.
+    std::unique_ptr<Chainstate> m_chainstate GUARDED_BY(::cs_main);
 };
 
 /** Deployment* info via ChainstateManager */

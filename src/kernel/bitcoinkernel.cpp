@@ -1081,12 +1081,11 @@ const btck_BlockTreeEntry* btck_chainstate_manager_get_best_entry(const btck_Cha
 void btck_chainstate_manager_destroy(btck_ChainstateManager* chainman)
 {
     {
-        LOCK(btck_ChainstateManager::get(chainman).m_chainman->GetMutex());
-        for (const auto& chainstate : btck_ChainstateManager::get(chainman).m_chainman->m_chainstates) {
-            if (chainstate->CanFlushToDisk()) {
-                chainstate->ForceFlushStateToDisk();
-                chainstate->ResetCoinsViews();
-            }
+        auto& cm{*btck_ChainstateManager::get(chainman).m_chainman};
+        LOCK(cm.GetMutex());
+        if (cm.m_chainstate && cm.m_chainstate->CanFlushToDisk()) {
+            cm.m_chainstate->ForceFlushStateToDisk();
+            cm.m_chainstate->ResetCoinsViews();
         }
     }
 
