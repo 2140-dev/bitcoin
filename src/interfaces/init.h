@@ -9,6 +9,7 @@
 #include <interfaces/echo.h>
 #include <interfaces/mining.h>
 #include <interfaces/node.h>
+#include <interfaces/noderpc.h>
 
 #include <memory>
 
@@ -33,6 +34,7 @@ public:
     virtual std::unique_ptr<Node> makeNode() { return nullptr; }
     virtual std::unique_ptr<Chain> makeChain() { return nullptr; }
     virtual std::unique_ptr<Mining> makeMining() { return nullptr; }
+    virtual std::unique_ptr<NodeRpc> makeNodeRpc() { return nullptr; }
     virtual std::unique_ptr<Echo> makeEcho() { return nullptr; }
     virtual void stop() {}
     virtual Ipc* ipc() { return nullptr; }

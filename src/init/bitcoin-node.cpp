@@ -8,6 +8,7 @@
 #include <interfaces/init.h>
 #include <interfaces/ipc.h>
 #include <interfaces/node.h>
+#include <interfaces/noderpc.h>
 #include <node/context.h>
 #include <util/check.h>
 
@@ -30,6 +31,7 @@ public:
     std::unique_ptr<interfaces::Node> makeNode() override { return interfaces::MakeNode(m_node); }
     std::unique_ptr<interfaces::Chain> makeChain() override { return interfaces::MakeChain(m_node); }
     std::unique_ptr<interfaces::Mining> makeMining() override { return interfaces::MakeMining(m_node); }
+    std::unique_ptr<interfaces::NodeRpc> makeNodeRpc() override { return interfaces::MakeNodeRpc(m_node); }
     std::unique_ptr<interfaces::Echo> makeEcho() override { return interfaces::MakeEcho(); }
     void stop() override { makeNode()->startShutdown(); }
     interfaces::Ipc* ipc() override { return m_ipc.get(); }

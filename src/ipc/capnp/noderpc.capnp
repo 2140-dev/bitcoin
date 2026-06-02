@@ -1,0 +1,87 @@
+# Copyright (c) 2025-present The Bitcoin Core developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+@0xb1a2c3d4e5f60718;
+
+using Cxx = import "/capnp/c++.capnp";
+$Cxx.namespace("ipc::capnp::messages");
+
+using Proxy = import "/mp/proxy.capnp";
+$Proxy.include("interfaces/noderpc.h");
+$Proxy.includeTypes("ipc/capnp/noderpc-types.h");
+
+interface NodeRpc $Proxy.wrap("interfaces::NodeRpc") {
+    destroy @0 (context :Proxy.Context) -> ();
+    getNetworkInfo @1 (context :Proxy.Context) -> (result :NetworkInfo);
+    getDeploymentInfo @2 (context :Proxy.Context, blockHash :Data) -> (result :DeploymentsInfo);
+}
+
+struct NetworkInfoNetwork $Proxy.wrap("interfaces::NetworkInfoNetwork") {
+    name @0 :Text;
+    limited @1 :Bool;
+    reachable @2 :Bool;
+    proxy @3 :Text;
+    proxyRandomizeCredentials @4 :Bool $Proxy.name("proxy_randomize_credentials");
+}
+
+struct NetworkInfoLocalAddress $Proxy.wrap("interfaces::NetworkInfoLocalAddress") {
+    address @0 :Text;
+    port @1 :UInt16;
+    score @2 :Int32;
+}
+
+struct NetworkInfo $Proxy.wrap("interfaces::NetworkInfo") {
+    version @0 :Int32;
+    subversion @1 :Text;
+    protocolversion @2 :Int32;
+    localservices @3 :Text;
+    localservicesnames @4 :List(Text);
+    localrelay @5 :Bool;
+    timeoffset @6 :Int64;
+    connections @7 :UInt64;
+    connectionsIn @8 :UInt64 $Proxy.name("connections_in");
+    connectionsOut @9 :UInt64 $Proxy.name("connections_out");
+    networkactive @10 :Bool;
+    networks @11 :List(NetworkInfoNetwork);
+    relayfee @12 :Int64;
+    incrementalfee @13 :Int64;
+    localaddresses @14 :List(NetworkInfoLocalAddress);
+    warnings @15 :List(Text);
+}
+
+struct BIP9Statistics $Proxy.wrap("interfaces::BIP9Statistics") {
+    period @0 :Int32;
+    threshold @1 :Int32;
+    elapsed @2 :Int32;
+    count @3 :Int32;
+    possible @4 :Bool;
+}
+
+struct BIP9DeploymentInfo $Proxy.wrap("interfaces::BIP9DeploymentInfo") {
+    bit @0 :Int32;
+    startTime @1 :Int64 $Proxy.name("start_time");
+    timeout @2 :Int64;
+    minActivationHeight @3 :Int32 $Proxy.name("min_activation_height");
+    status @4 :Text;
+    since @5 :Int32;
+    statusNext @6 :Text $Proxy.name("status_next");
+    statistics @7 :BIP9Statistics;
+    signalling @8 :Text;
+}
+
+struct DeploymentInfo $Proxy.wrap("interfaces::DeploymentInfo") {
+    name @0 :Text;
+    type @1 :Text;
+    active @2 :Bool;
+    height @3 :Int32;
+    bip9 @4 :BIP9DeploymentInfo;
+}
+
+struct DeploymentsInfo $Proxy.wrap("interfaces::DeploymentsInfo") {
+    hash @0 :Text;
+    height @1 :Int32;
+    scriptFlags @2 :List(Text) $Proxy.name("script_flags");
+    deployments @3 :List(DeploymentInfo);
+}
+

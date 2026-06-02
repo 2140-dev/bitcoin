@@ -8,17 +8,22 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <chainstate.h>
+#include <clientversion.h>
 #include <coins.h>
 #include <common/args.h>
 #include <common/settings.h>
 #include <consensus/amount.h>
 #include <consensus/merkle.h>
+#include <consensus/params.h>
 #include <consensus/validation.h>
+#include <deploymentinfo.h>
+#include <deploymentstatus.h>
 #include <init.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
 #include <interfaces/mining.h>
 #include <interfaces/node.h>
+#include <interfaces/noderpc.h>
 #include <interfaces/types.h>
 #include <kernel/context.h>
 #include <key.h>
@@ -38,6 +43,7 @@
 #include <node/mini_miner.h>
 #include <node/mining_args.h>
 #include <node/mining_types.h>
+#include <node/protocol_version.h>
 #include <node/transaction.h>
 #include <node/types.h>
 #include <node/warnings.h>
@@ -46,8 +52,11 @@
 #include <policy/policy.h>
 #include <policy/rbf.h>
 #include <primitives/block.h>
+#include <protocol.h>
+#include <script/interpreter.h>
 #include <primitives/transaction.h>
 #include <sync.h>
+#include <tinyformat.h>
 #include <txmempool.h>
 #include <uint256.h>
 #include <univalue.h>
@@ -81,6 +90,14 @@ using interfaces::Handler;
 using interfaces::MakeSignalHandler;
 using interfaces::Mining;
 using interfaces::Node;
+using interfaces::BIP9DeploymentInfo;
+using interfaces::BIP9Statistics;
+using interfaces::DeploymentInfo;
+using interfaces::DeploymentsInfo;
+using interfaces::NetworkInfo;
+using interfaces::NetworkInfoLocalAddress;
+using interfaces::NetworkInfoNetwork;
+using interfaces::NodeRpc;
 using node::BlockAssembler;
 using node::BlockCreateOptions;
 using node::BlockWaitOptions;
@@ -907,12 +924,152 @@ public:
     const NodeContext& m_node;
 };
 
+class NodeRpcImpl : public NodeRpc
+{
+public:
+    explicit NodeRpcImpl(NodeContext& node) : m_node(node) {}
+    NetworkInfo getNetworkInfo() override
+    {
+        NetworkInfo info;
+        info.version = CLIENT_VERSION;
+        info.subversion = strSubVersion;
+        info.protocolversion = PROTOCOL_VERSION;
+        if (m_node.connman) {
+            const ServiceFlags services = m_node.connman->GetLocalServices();
+            info.localservices = strprintf("%016x", static_cast<uint64_t>(services));
+            info.localservicesnames = serviceFlagsToStr(services);
+        }
+        if (m_node.peerman) {
+            const auto peerman_info{m_node.peerman->GetInfo()};
+            info.localrelay = !peerman_info.ignores_incoming_txs;
+            info.timeoffset = Ticks<std::chrono::seconds>(peerman_info.median_outbound_time_offset);
+        }
+        if (m_node.connman) {
+            info.networkactive = m_node.connman->GetNetworkActive();
+            info.connections = m_node.connman->GetNodeCount(ConnectionDirection::Both);
+            info.connections_in = m_node.connman->GetNodeCount(ConnectionDirection::In);
+            info.connections_out = m_node.connman->GetNodeCount(ConnectionDirection::Out);
+        }
+        for (int n = 0; n < NET_MAX; ++n) {
+            const enum Network network = static_cast<enum Network>(n);
+            if (network == NET_UNROUTABLE || network == NET_INTERNAL) continue;
+            NetworkInfoNetwork& net = info.networks.emplace_back();
+            net.name = GetNetworkName(network);
+            net.limited = !g_reachable_nets.Contains(network);
+            net.reachable = g_reachable_nets.Contains(network);
+            if (const auto proxy = GetProxy(network)) {
+                net.proxy = proxy->ToString();
+                net.proxy_randomize_credentials = proxy->m_tor_stream_isolation;
+            }
+        }
+        if (m_node.mempool) {
+            info.relayfee = m_node.mempool->m_opts.min_relay_feerate.GetFeePerK();
+            info.incrementalfee = m_node.mempool->m_opts.incremental_relay_feerate.GetFeePerK();
+        }
+        {
+            LOCK(g_maplocalhost_mutex);
+            for (const auto& [addr, service] : mapLocalHost) {
+                NetworkInfoLocalAddress& local = info.localaddresses.emplace_back();
+                local.address = addr.ToStringAddr();
+                local.port = service.nPort;
+                local.score = service.nScore;
+            }
+        }
+        if (m_node.warnings) {
+            for (const auto& warning : m_node.warnings->GetMessages()) {
+                info.warnings.push_back(warning.original);
+            }
+        }
+        return info;
+    }
+    DeploymentsInfo getDeploymentInfo(const std::optional<uint256>& block_hash) override
+    {
+        ChainstateManager& chainman = *Assert(m_node.chainman);
+        LOCK(::cs_main);
+
+        const CBlockIndex* blockindex;
+        if (!block_hash) {
+            blockindex = Assert(chainman.ActiveChain().Tip());
+        } else {
+            blockindex = chainman.m_blockman.LookupBlockIndex(*block_hash);
+            if (!blockindex) {
+                throw std::runtime_error("Block not found");
+            }
+        }
+
+        DeploymentsInfo info;
+        info.hash = blockindex->GetBlockHash().ToString();
+        info.height = blockindex->nHeight;
+        for (const auto& flag : GetScriptFlagNames(GetBlockScriptFlags(*blockindex, chainman))) {
+            info.script_flags.push_back(flag);
+        }
+
+        // Buried deployments (BIP 90): active from a hardcoded height.
+        const auto add_buried = [&](Consensus::BuriedDeployment dep) {
+            if (!DeploymentEnabled(chainman, dep)) return;
+            DeploymentInfo& d = info.deployments.emplace_back();
+            d.name = DeploymentName(dep);
+            d.type = "buried";
+            d.active = DeploymentActiveAfter(blockindex, chainman, dep);
+            d.height = chainman.GetConsensus().DeploymentHeight(dep);
+        };
+        add_buried(Consensus::DEPLOYMENT_HEIGHTINCB);
+        add_buried(Consensus::DEPLOYMENT_DERSIG);
+        add_buried(Consensus::DEPLOYMENT_CLTV);
+        add_buried(Consensus::DEPLOYMENT_CSV);
+        add_buried(Consensus::DEPLOYMENT_SEGWIT);
+
+        // BIP 9 versionbits deployments.
+        const auto add_bip9 = [&](Consensus::DeploymentPos pos) {
+            if (!DeploymentEnabled(chainman, pos)) return;
+            DeploymentInfo& d = info.deployments.emplace_back();
+            d.name = DeploymentName(pos);
+            d.type = "bip9";
+
+            const BIP9Info bip9_info{chainman.m_versionbitscache.Info(*blockindex, chainman.GetConsensus(), pos)};
+            const Consensus::BIP9Deployment& depparams{chainman.GetConsensus().vDeployments[pos]};
+            BIP9DeploymentInfo& bip9 = d.bip9.emplace();
+            if (bip9_info.stats.has_value()) {
+                bip9.bit = depparams.bit;
+            }
+            bip9.start_time = depparams.nStartTime;
+            bip9.timeout = depparams.nTimeout;
+            bip9.min_activation_height = depparams.min_activation_height;
+            bip9.status = bip9_info.current_state;
+            bip9.since = bip9_info.since;
+            bip9.status_next = bip9_info.next_state;
+            if (bip9_info.stats.has_value()) {
+                BIP9Statistics& stats = bip9.statistics.emplace();
+                stats.period = bip9_info.stats->period;
+                stats.elapsed = bip9_info.stats->elapsed;
+                stats.count = bip9_info.stats->count;
+                stats.threshold = bip9_info.stats->threshold;
+                stats.possible = bip9_info.stats->possible;
+
+                bip9.signalling.reserve(bip9_info.signalling_blocks.size());
+                for (const bool s : bip9_info.signalling_blocks) {
+                    bip9.signalling.push_back(s ? '#' : '-');
+                }
+            }
+            if (bip9_info.active_since.has_value()) {
+                d.height = *bip9_info.active_since;
+                d.active = (*bip9_info.active_since <= blockindex->nHeight + 1);
+            }
+        };
+        add_bip9(Consensus::DEPLOYMENT_TESTDUMMY);
+
+        return info;
+    }
+    NodeContext& m_node;
+};
+
 } // namespace
 } // namespace node
 
 namespace interfaces {
 std::unique_ptr<Node> MakeNode(node::NodeContext& context) { return std::make_unique<node::NodeImpl>(context); }
 std::unique_ptr<Chain> MakeChain(node::NodeContext& context) { return std::make_unique<node::ChainImpl>(context); }
+std::unique_ptr<NodeRpc> MakeNodeRpc(node::NodeContext& context) { return std::make_unique<node::NodeRpcImpl>(context); }
 std::unique_ptr<Mining> MakeMining(const node::NodeContext& context, bool wait_loaded)
 {
     if (wait_loaded) {
