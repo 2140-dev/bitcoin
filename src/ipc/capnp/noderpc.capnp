@@ -16,6 +16,13 @@ interface NodeRpc $Proxy.wrap("interfaces::NodeRpc") {
     getNetworkInfo @1 (context :Proxy.Context) -> (result :NetworkInfo);
     getDeploymentInfo @2 (context :Proxy.Context, blockHash :Data) -> (result :DeploymentsInfo);
     getBlockchainInfo @3 (context :Proxy.Context) -> (result :BlockchainInfo);
+    estimateSmartFee @4 (context :Proxy.Context, confTarget :Int32, conservative :Bool) -> (result :SmartFeeEstimate);
+}
+
+struct SmartFeeEstimate $Proxy.wrap("interfaces::SmartFeeEstimate") {
+    feerate @0 :Int64;
+    errors @1 :List(Text);
+    blocks @2 :Int32;
 }
 
 struct BlockchainPruneInfo $Proxy.wrap("interfaces::BlockchainPruneInfo") {

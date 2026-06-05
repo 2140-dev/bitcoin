@@ -46,6 +46,12 @@ struct BlockchainInfo {
     std::vector<std::string> warnings;
 };
 
+struct SmartFeeEstimate {
+    int64_t feerate{0};
+    std::vector<std::string> errors;
+    int blocks{0};
+};
+
 struct NetworkInfoNetwork {
     std::string name;
     bool limited{false};
@@ -120,6 +126,11 @@ public:
     virtual ~NodeRpc() = default;
 
     virtual BlockchainInfo getBlockchainInfo() = 0;
+
+    //! Estimate the fee rate (sat/kvB) needed for confirmation within
+    //! conf_target blocks, mirroring the estimatesmartfee RPC (applies the
+    //! mempool/relay fee floor and reports the target actually used).
+    virtual SmartFeeEstimate estimateSmartFee(int conf_target, bool conservative) = 0;
 
     virtual NetworkInfo getNetworkInfo() = 0;
 

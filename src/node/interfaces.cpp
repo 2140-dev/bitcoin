@@ -72,6 +72,7 @@
 #include <util/translation.h>
 #include <validationinterface.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -98,6 +99,7 @@ using interfaces::BIP9DeploymentInfo;
 using interfaces::BIP9Statistics;
 using interfaces::BlockchainInfo;
 using interfaces::BlockchainPruneInfo;
+using interfaces::SmartFeeEstimate;
 using interfaces::DeploymentInfo;
 using interfaces::DeploymentsInfo;
 using interfaces::NetworkInfo;
@@ -1025,6 +1027,38 @@ public:
             }
         }
         return info;
+    }
+    SmartFeeEstimate estimateSmartFee(int conf_target, bool conservative) override
+    {
+        SmartFeeEstimate result;
+        if (!m_node.fee_estimator || !m_node.mempool) {
+            result.errors.emplace_back("Fee estimation disabled");
+            return result;
+        }
+        CBlockPolicyEstimator& fee_estimator = *m_node.fee_estimator;
+        CTxMemPool& mempool = *m_node.mempool;
+
+        // Ensure the estimator has seen all recently connected blocks.
+        CHECK_NONFATAL(mempool.m_opts.signals)->SyncWithValidationInterfaceQueue();
+
+        const unsigned int max_target = fee_estimator.HighestTargetTracked(FeeEstimateHorizon::LONG_HALFLIFE);
+        if (conf_target < 1 || static_cast<unsigned int>(conf_target) > max_target) {
+            throw std::runtime_error(strprintf("Invalid conf_target, must be between %u and %u", 1, max_target));
+        }
+
+        FeeCalculation fee_calc;
+        CFeeRate fee_rate{fee_estimator.estimateSmartFee(conf_target, &fee_calc, conservative)};
+        if (fee_rate != CFeeRate(0)) {
+            // Floor the estimate at the mempool min fee and the relay fee, like the RPC.
+            const CFeeRate min_mempool_feerate{mempool.GetMinFee()};
+            const CFeeRate min_relay_feerate{mempool.m_opts.min_relay_feerate};
+            fee_rate = std::max({fee_rate, min_mempool_feerate, min_relay_feerate});
+            result.feerate = fee_rate.GetFeePerK();
+        } else {
+            result.errors.emplace_back("Insufficient data or no feerate found");
+        }
+        result.blocks = fee_calc.returnedTarget;
+        return result;
     }
     NetworkInfo getNetworkInfo() override
     {
