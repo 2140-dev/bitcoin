@@ -20,6 +20,32 @@ struct NodeContext;
 
 namespace interfaces {
 
+struct BlockchainPruneInfo {
+    int height{0};
+    bool automatic{false};
+    uint64_t target_size{0};
+};
+
+struct BlockchainInfo {
+    std::string chain;
+    int blocks{0};
+    int headers{0};
+    std::string bestblockhash;
+    std::string bits;
+    std::string target;
+    double difficulty{0};
+    int64_t time{0};
+    int64_t mediantime{0};
+    double verificationprogress{0};
+    bool initialblockdownload{false};
+    std::string chainwork;
+    uint64_t size_on_disk{0};
+    bool pruned{false};
+    std::optional<BlockchainPruneInfo> prune;
+    std::optional<std::string> signet_challenge;
+    std::vector<std::string> warnings;
+};
+
 struct NetworkInfoNetwork {
     std::string name;
     bool limited{false};
@@ -92,6 +118,8 @@ class NodeRpc
 {
 public:
     virtual ~NodeRpc() = default;
+
+    virtual BlockchainInfo getBlockchainInfo() = 0;
 
     virtual NetworkInfo getNetworkInfo() = 0;
 

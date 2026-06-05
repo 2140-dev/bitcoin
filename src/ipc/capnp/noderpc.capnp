@@ -15,6 +15,33 @@ interface NodeRpc $Proxy.wrap("interfaces::NodeRpc") {
     destroy @0 (context :Proxy.Context) -> ();
     getNetworkInfo @1 (context :Proxy.Context) -> (result :NetworkInfo);
     getDeploymentInfo @2 (context :Proxy.Context, blockHash :Data) -> (result :DeploymentsInfo);
+    getBlockchainInfo @3 (context :Proxy.Context) -> (result :BlockchainInfo);
+}
+
+struct BlockchainPruneInfo $Proxy.wrap("interfaces::BlockchainPruneInfo") {
+    height @0 :Int32;
+    automatic @1 :Bool;
+    targetSize @2 :UInt64 $Proxy.name("target_size");
+}
+
+struct BlockchainInfo $Proxy.wrap("interfaces::BlockchainInfo") {
+    chain @0 :Text;
+    blocks @1 :Int32;
+    headers @2 :Int32;
+    bestblockhash @3 :Text;
+    bits @4 :Text;
+    target @5 :Text;
+    difficulty @6 :Float64;
+    time @7 :Int64;
+    mediantime @8 :Int64;
+    verificationprogress @9 :Float64;
+    initialblockdownload @10 :Bool;
+    chainwork @11 :Text;
+    sizeOnDisk @12 :UInt64 $Proxy.name("size_on_disk");
+    pruned @13 :Bool;
+    prune @14 :BlockchainPruneInfo;
+    signetChallenge @15 :Text $Proxy.name("signet_challenge");
+    warnings @16 :List(Text);
 }
 
 struct NetworkInfoNetwork $Proxy.wrap("interfaces::NetworkInfoNetwork") {

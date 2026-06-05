@@ -51,12 +51,16 @@
 #include <policy/fees/block_policy_estimator.h>
 #include <policy/policy.h>
 #include <policy/rbf.h>
+#include <arith_uint256.h>
+#include <pow.h>
 #include <primitives/block.h>
 #include <protocol.h>
 #include <script/interpreter.h>
 #include <primitives/transaction.h>
 #include <sync.h>
 #include <tinyformat.h>
+#include <util/chaintype.h>
+#include <util/strencodings.h>
 #include <txmempool.h>
 #include <uint256.h>
 #include <univalue.h>
@@ -92,6 +96,8 @@ using interfaces::Mining;
 using interfaces::Node;
 using interfaces::BIP9DeploymentInfo;
 using interfaces::BIP9Statistics;
+using interfaces::BlockchainInfo;
+using interfaces::BlockchainPruneInfo;
 using interfaces::DeploymentInfo;
 using interfaces::DeploymentsInfo;
 using interfaces::NetworkInfo;
@@ -924,10 +930,102 @@ public:
     const NodeContext& m_node;
 };
 
+// Difficulty as a multiple of the minimum difficulty, mirroring the old
+// rpc/blockchain.cpp helper.
+double GetDifficulty(const CBlockIndex& blockindex)
+{
+    int nShift = (blockindex.nBits >> 24) & 0xff;
+    double dDiff = (double)0x0000ffff / (double)(blockindex.nBits & 0x00ffffff);
+    while (nShift < 29) {
+        dDiff *= 256.0;
+        nShift++;
+    }
+    while (nShift > 29) {
+        dDiff /= 256.0;
+        nShift--;
+    }
+    return dDiff;
+}
+
+// Difficulty target for a block, mirroring the old rpc/util.cpp GetTarget.
+uint256 GetTarget(const CBlockIndex& blockindex, const uint256 pow_limit)
+{
+    arith_uint256 target{*CHECK_NONFATAL(DeriveTarget(blockindex.nBits, pow_limit))};
+    return ArithToUint256(target);
+}
+
+// Height of the last pruned block, mirroring the old rpc/blockchain.cpp helper.
+std::optional<int> GetPruneHeight(const BlockManager& blockman, const CChain& chain) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    AssertLockHeld(::cs_main);
+
+    // Search for the last block missing block data or undo data. Don't let the
+    // search consider the genesis block, because the genesis block does not
+    // have undo data, but should not be considered pruned.
+    const CBlockIndex* first_block{chain[1]};
+    const CBlockIndex* chain_tip{chain.Tip()};
+
+    // If there are no blocks after the genesis block, or no blocks at all, nothing is pruned.
+    if (!first_block || !chain_tip) return std::nullopt;
+
+    // If the chain tip is pruned, everything is pruned.
+    if ((chain_tip->nStatus & BLOCK_HAVE_MASK) != BLOCK_HAVE_MASK) return chain_tip->nHeight;
+
+    const auto& first_unpruned{blockman.GetFirstBlock(*chain_tip, /*status_mask=*/BLOCK_HAVE_MASK, first_block)};
+    if (&first_unpruned == first_block) {
+        // All blocks between first_block and chain_tip have data, so nothing is pruned.
+        return std::nullopt;
+    }
+
+    // Block before the first unpruned block is the last pruned block.
+    return CHECK_NONFATAL(first_unpruned.pprev)->nHeight;
+}
+
 class NodeRpcImpl : public NodeRpc
 {
 public:
     explicit NodeRpcImpl(NodeContext& node) : m_node(node) {}
+    BlockchainInfo getBlockchainInfo() override
+    {
+        ChainstateManager& chainman = *Assert(m_node.chainman);
+        LOCK(::cs_main);
+        Chainstate& active_chainstate = chainman.ActiveChainstate();
+        const CBlockIndex& tip{*CHECK_NONFATAL(active_chainstate.m_chain.Tip())};
+
+        BlockchainInfo info;
+        info.chain = chainman.GetParams().GetChainTypeString();
+        info.blocks = tip.nHeight;
+        info.headers = chainman.m_best_header ? chainman.m_best_header->nHeight : -1;
+        info.bestblockhash = tip.GetBlockHash().GetHex();
+        info.bits = strprintf("%08x", tip.nBits);
+        info.target = GetTarget(tip, chainman.GetConsensus().powLimit).GetHex();
+        info.difficulty = GetDifficulty(tip);
+        info.time = tip.GetBlockTime();
+        info.mediantime = tip.GetMedianTimePast();
+        info.verificationprogress = chainman.GuessVerificationProgress(&tip);
+        info.initialblockdownload = chainman.IsInitialBlockDownload();
+        info.chainwork = tip.nChainWork.GetHex();
+        info.size_on_disk = chainman.m_blockman.CalculateCurrentUsage();
+        info.pruned = chainman.m_blockman.IsPruneMode();
+        if (info.pruned) {
+            BlockchainPruneInfo& prune = info.prune.emplace();
+            const auto prune_height{GetPruneHeight(chainman.m_blockman, active_chainstate.m_chain)};
+            prune.height = prune_height ? prune_height.value() + 1 : 0;
+            prune.automatic = chainman.m_blockman.GetPruneTarget() != BlockManager::PRUNE_TARGET_MANUAL;
+            if (prune.automatic) {
+                prune.target_size = chainman.m_blockman.GetPruneTarget();
+            }
+        }
+        if (chainman.GetParams().GetChainType() == ChainType::SIGNET) {
+            info.signet_challenge = HexStr(chainman.GetParams().GetConsensus().signet_challenge);
+        }
+        if (m_node.warnings) {
+            for (const auto& warning : m_node.warnings->GetMessages()) {
+                info.warnings.push_back(warning.original);
+            }
+        }
+        return info;
+    }
     NetworkInfo getNetworkInfo() override
     {
         NetworkInfo info;
