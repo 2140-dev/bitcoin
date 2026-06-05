@@ -99,6 +99,7 @@ using interfaces::BIP9DeploymentInfo;
 using interfaces::BIP9Statistics;
 using interfaces::BlockchainInfo;
 using interfaces::BlockchainPruneInfo;
+using interfaces::BlockHeaderInfo;
 using interfaces::SmartFeeEstimate;
 using interfaces::DeploymentInfo;
 using interfaces::DeploymentsInfo;
@@ -949,6 +950,18 @@ double GetDifficulty(const CBlockIndex& blockindex)
     return dDiff;
 }
 
+// Number of confirmations for a block (and its successor on the active chain),
+// mirroring the old rpc/blockchain.cpp helper.
+int ComputeNextBlockAndDepth(const CBlockIndex& tip, const CBlockIndex& blockindex, const CBlockIndex*& next)
+{
+    next = tip.GetAncestor(blockindex.nHeight + 1);
+    if (next && next->pprev == &blockindex) {
+        return tip.nHeight - blockindex.nHeight + 1;
+    }
+    next = nullptr;
+    return &blockindex == &tip ? 1 : -1;
+}
+
 // Difficulty target for a block, mirroring the old rpc/util.cpp GetTarget.
 uint256 GetTarget(const CBlockIndex& blockindex, const uint256 pow_limit)
 {
@@ -1027,6 +1040,75 @@ public:
             }
         }
         return info;
+    }
+    std::string getBestBlockHash() override
+    {
+        ChainstateManager& chainman = *Assert(m_node.chainman);
+        LOCK(::cs_main);
+        return chainman.ActiveChain().Tip()->GetBlockHash().GetHex();
+    }
+    std::string getBlockHash(int height) override
+    {
+        ChainstateManager& chainman = *Assert(m_node.chainman);
+        LOCK(::cs_main);
+        const CChain& active_chain = chainman.ActiveChain();
+        if (height < 0 || height > active_chain.Height()) {
+            throw std::runtime_error("Block height out of range");
+        }
+        return active_chain[height]->GetBlockHash().GetHex();
+    }
+    BlockHeaderInfo getBlockHeader(const uint256& block_hash) override
+    {
+        ChainstateManager& chainman = *Assert(m_node.chainman);
+        const CBlockIndex* pblockindex;
+        const CBlockIndex* tip;
+        {
+            LOCK(::cs_main);
+            pblockindex = chainman.m_blockman.LookupBlockIndex(block_hash);
+            tip = chainman.ActiveChain().Tip();
+        }
+        if (!pblockindex) {
+            throw std::runtime_error("Block not found");
+        }
+
+        BlockHeaderInfo info;
+        info.hash = pblockindex->GetBlockHash().GetHex();
+        const CBlockIndex* pnext;
+        info.confirmations = ComputeNextBlockAndDepth(*Assert(tip), *pblockindex, pnext);
+        info.height = pblockindex->nHeight;
+        info.version = pblockindex->nVersion;
+        info.version_hex = strprintf("%08x", pblockindex->nVersion);
+        info.merkleroot = pblockindex->hashMerkleRoot.GetHex();
+        info.time = pblockindex->nTime;
+        info.mediantime = pblockindex->GetMedianTimePast();
+        info.nonce = pblockindex->nNonce;
+        info.bits = strprintf("%08x", pblockindex->nBits);
+        info.target = GetTarget(*pblockindex, chainman.GetConsensus().powLimit).GetHex();
+        info.difficulty = GetDifficulty(*pblockindex);
+        info.chainwork = pblockindex->nChainWork.GetHex();
+        info.n_tx = pblockindex->nTx;
+        if (pblockindex->pprev) info.previousblockhash = pblockindex->pprev->GetBlockHash().GetHex();
+        if (pnext) info.nextblockhash = pnext->GetBlockHash().GetHex();
+        return info;
+    }
+    CBlock getBlock(const uint256& block_hash) override
+    {
+        ChainstateManager& chainman = *Assert(m_node.chainman);
+        const CBlockIndex* pblockindex;
+        {
+            LOCK(::cs_main);
+            pblockindex = chainman.m_blockman.LookupBlockIndex(block_hash);
+        }
+        if (!pblockindex) {
+            throw std::runtime_error("Block not found");
+        }
+
+        CBlock block;
+        if (!chainman.m_blockman.ReadBlock(block, *pblockindex)) {
+            // Block data may be unavailable if the block was pruned.
+            throw std::runtime_error("Block not available (pruned data?)");
+        }
+        return block;
     }
     SmartFeeEstimate estimateSmartFee(int conf_target, bool conservative) override
     {

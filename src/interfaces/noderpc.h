@@ -5,6 +5,7 @@
 #ifndef BITCOIN_INTERFACES_NODERPC_H
 #define BITCOIN_INTERFACES_NODERPC_H
 
+#include <primitives/block.h>
 #include <uint256.h>
 
 #include <cstddef>
@@ -44,6 +45,25 @@ struct BlockchainInfo {
     std::optional<BlockchainPruneInfo> prune;
     std::optional<std::string> signet_challenge;
     std::vector<std::string> warnings;
+};
+
+struct BlockHeaderInfo {
+    std::string hash;
+    int confirmations{0};
+    int height{0};
+    int version{0};
+    std::string version_hex;
+    std::string merkleroot;
+    int64_t time{0};
+    int64_t mediantime{0};
+    uint32_t nonce{0};
+    std::string bits;
+    std::string target;
+    double difficulty{0};
+    std::string chainwork;
+    int n_tx{0};
+    std::optional<std::string> previousblockhash;
+    std::optional<std::string> nextblockhash;
 };
 
 struct SmartFeeEstimate {
@@ -126,6 +146,22 @@ public:
     virtual ~NodeRpc() = default;
 
     virtual BlockchainInfo getBlockchainInfo() = 0;
+
+    //! Hash of the active chain tip, hex-encoded. Mirrors getbestblockhash.
+    virtual std::string getBestBlockHash() = 0;
+
+    //! Hash of the active-chain block at the given height, hex-encoded. Throws
+    //! if the height is out of range. Mirrors getblockhash.
+    virtual std::string getBlockHash(int height) = 0;
+
+    //! Verbose header info for the given block. Throws if the block is not
+    //! found. Mirrors the verbose getblockheader.
+    virtual BlockHeaderInfo getBlockHeader(const uint256& block_hash) = 0;
+
+    //! Full block for the given hash, read from disk. Throws if the block is
+    //! not found or its data is unavailable (pruned). Mirrors getblock with
+    //! verbosity 0 (the block is serialized over the wire).
+    virtual CBlock getBlock(const uint256& block_hash) = 0;
 
     //! Estimate the fee rate (sat/kvB) needed for confirmation within
     //! conf_target blocks, mirroring the estimatesmartfee RPC (applies the

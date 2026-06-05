@@ -17,12 +17,35 @@ interface NodeRpc $Proxy.wrap("interfaces::NodeRpc") {
     getDeploymentInfo @2 (context :Proxy.Context, blockHash :Data) -> (result :DeploymentsInfo);
     getBlockchainInfo @3 (context :Proxy.Context) -> (result :BlockchainInfo);
     estimateSmartFee @4 (context :Proxy.Context, confTarget :Int32, conservative :Bool) -> (result :SmartFeeEstimate);
+    getBestBlockHash @5 (context :Proxy.Context) -> (result :Text);
+    getBlockHash @6 (context :Proxy.Context, height :Int32) -> (result :Text);
+    getBlockHeader @7 (context :Proxy.Context, blockHash :Data) -> (result :BlockHeaderInfo);
+    getBlock @8 (context :Proxy.Context, blockHash :Data) -> (result :Data);
 }
 
 struct SmartFeeEstimate $Proxy.wrap("interfaces::SmartFeeEstimate") {
     feerate @0 :Int64;
     errors @1 :List(Text);
     blocks @2 :Int32;
+}
+
+struct BlockHeaderInfo $Proxy.wrap("interfaces::BlockHeaderInfo") {
+    hash @0 :Text;
+    confirmations @1 :Int32;
+    height @2 :Int32;
+    version @3 :Int32;
+    versionHex @4 :Text $Proxy.name("version_hex");
+    merkleroot @5 :Text;
+    time @6 :Int64;
+    mediantime @7 :Int64;
+    nonce @8 :UInt32;
+    bits @9 :Text;
+    target @10 :Text;
+    difficulty @11 :Float64;
+    chainwork @12 :Text;
+    nTx @13 :Int32 $Proxy.name("n_tx");
+    previousblockhash @14 :Text;
+    nextblockhash @15 :Text;
 }
 
 struct BlockchainPruneInfo $Proxy.wrap("interfaces::BlockchainPruneInfo") {
