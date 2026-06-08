@@ -21,6 +21,23 @@ interface NodeRpc $Proxy.wrap("interfaces::NodeRpc") {
     getBlockHash @6 (context :Proxy.Context, height :Int32) -> (result :Text);
     getBlockHeader @7 (context :Proxy.Context, blockHash :Data) -> (result :BlockHeaderInfo);
     getBlock @8 (context :Proxy.Context, blockHash :Data) -> (result :Data);
+    getTxOut @9 (context :Proxy.Context, txid :Data, n :UInt32, includeMempool :Bool) -> (result :TxOutInfo);
+}
+
+struct TxOutScriptPubKey $Proxy.wrap("interfaces::TxOutScriptPubKey") {
+    scriptAsm @0 :Text $Proxy.name("script_asm");
+    desc @1 :Text;
+    hex @2 :Text;
+    type @3 :Text;
+    address @4 :Text;
+}
+
+struct TxOutInfo $Proxy.wrap("interfaces::TxOutInfo") {
+    bestblock @0 :Text;
+    confirmations @1 :Int32;
+    value @2 :Int64;
+    scriptPubKey @3 :TxOutScriptPubKey $Proxy.name("script_pub_key");
+    coinbase @4 :Bool;
 }
 
 struct SmartFeeEstimate $Proxy.wrap("interfaces::SmartFeeEstimate") {

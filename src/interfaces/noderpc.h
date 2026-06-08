@@ -72,6 +72,22 @@ struct SmartFeeEstimate {
     int blocks{0};
 };
 
+struct TxOutScriptPubKey {
+    std::string script_asm;
+    std::string desc;
+    std::string hex;
+    std::string type;
+    std::optional<std::string> address;
+};
+
+struct TxOutInfo {
+    std::string bestblock;
+    int confirmations{0};
+    int64_t value{0};
+    TxOutScriptPubKey script_pub_key;
+    bool coinbase{false};
+};
+
 struct NetworkInfoNetwork {
     std::string name;
     bool limited{false};
@@ -162,6 +178,12 @@ public:
     //! not found or its data is unavailable (pruned). Mirrors getblock with
     //! verbosity 0 (the block is serialized over the wire).
     virtual CBlock getBlock(const uint256& block_hash) = 0;
+
+    //! Details about an unspent transaction output, or nullopt if the output is
+    //! not found (spent or never existed). When include_mempool is set, outputs
+    //! spent in the mempool are treated as unavailable. The value is in
+    //! satoshis. Mirrors gettxout.
+    virtual std::optional<TxOutInfo> getTxOut(const uint256& txid, uint32_t n, bool include_mempool) = 0;
 
     //! Estimate the fee rate (sat/kvB) needed for confirmation within
     //! conf_target blocks, mirroring the estimatesmartfee RPC (applies the

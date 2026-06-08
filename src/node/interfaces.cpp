@@ -16,6 +16,7 @@
 #include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <consensus/validation.h>
+#include <core_io.h>
 #include <deploymentinfo.h>
 #include <deploymentstatus.h>
 #include <init.h>
@@ -101,6 +102,7 @@ using interfaces::BlockchainInfo;
 using interfaces::BlockchainPruneInfo;
 using interfaces::BlockHeaderInfo;
 using interfaces::SmartFeeEstimate;
+using interfaces::TxOutInfo;
 using interfaces::DeploymentInfo;
 using interfaces::DeploymentsInfo;
 using interfaces::NetworkInfo;
@@ -1109,6 +1111,47 @@ public:
             throw std::runtime_error("Block not available (pruned data?)");
         }
         return block;
+    }
+    std::optional<TxOutInfo> getTxOut(const uint256& txid, uint32_t n, bool include_mempool) override
+    {
+        ChainstateManager& chainman = *Assert(m_node.chainman);
+        LOCK(::cs_main);
+
+        const COutPoint out{Txid::FromUint256(txid), n};
+        Chainstate& active_chainstate = chainman.ActiveChainstate();
+        CCoinsViewCache* coins_view = &active_chainstate.CoinsTip();
+
+        std::optional<Coin> coin;
+        if (include_mempool) {
+            CTxMemPool& mempool = *Assert(m_node.mempool);
+            LOCK(mempool.cs);
+            CCoinsViewMemPool view(coins_view, mempool);
+            if (!mempool.isSpent(out)) coin = view.GetCoin(out);
+        } else {
+            coin = coins_view->GetCoin(out);
+        }
+        if (!coin) return std::nullopt;
+
+        TxOutInfo info;
+        const CBlockIndex* pindex = active_chainstate.m_blockman.LookupBlockIndex(coins_view->GetBestBlock());
+        info.bestblock = pindex->GetBlockHash().GetHex();
+        if (coin->nHeight == MEMPOOL_HEIGHT) {
+            info.confirmations = 0;
+        } else {
+            info.confirmations = pindex->nHeight - coin->nHeight + 1;
+        }
+        info.value = coin->out.nValue;
+
+        UniValue o(UniValue::VOBJ);
+        ScriptToUniv(coin->out.scriptPubKey, /*out=*/o, /*include_hex=*/true, /*include_address=*/true);
+        info.script_pub_key.script_asm = o["asm"].get_str();
+        info.script_pub_key.desc = o["desc"].get_str();
+        info.script_pub_key.hex = o["hex"].get_str();
+        info.script_pub_key.type = o["type"].get_str();
+        if (o.exists("address")) info.script_pub_key.address = o["address"].get_str();
+
+        info.coinbase = coin->IsCoinBase();
+        return info;
     }
     SmartFeeEstimate estimateSmartFee(int conf_target, bool conservative) override
     {
