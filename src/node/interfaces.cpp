@@ -47,9 +47,11 @@
 #include <node/mining_types.h>
 #include <node/protocol_version.h>
 #include <node/transaction.h>
+#include <mempool_validation.h>
 #include <node/types.h>
 #include <node/warnings.h>
 #include <policy/feerate.h>
+#include <policy/packages.h>
 #include <policy/fees/block_policy_estimator.h>
 #include <policy/policy.h>
 #include <policy/rbf.h>
@@ -111,6 +113,8 @@ using interfaces::TxInput;
 using interfaces::TxOutput;
 using interfaces::TxScriptSig;
 using interfaces::TxBlockContext;
+using interfaces::TestMempoolAcceptResult;
+using interfaces::TestMempoolAcceptFees;
 using interfaces::DeploymentInfo;
 using interfaces::DeploymentsInfo;
 using interfaces::NetworkInfo;
@@ -1268,6 +1272,83 @@ public:
             result.details = BuildTransactionDetails(*tx, hash_block, in_active_chain, chainman);
         }
         return result;
+    }
+    std::vector<TestMempoolAcceptResult> testMempoolAccept(const std::vector<CTransactionRef>& txns, int64_t max_fee_rate) override
+    {
+        if (txns.size() < 1 || txns.size() > MAX_PACKAGE_COUNT) {
+            throw std::runtime_error(strprintf("Array must contain between 1 and %u transactions.", MAX_PACKAGE_COUNT));
+        }
+
+        CTxMemPool& mempool = *Assert(m_node.mempool);
+        ChainstateManager& chainman = *Assert(m_node.chainman);
+        Chainstate& chainstate = chainman.ActiveChainstate();
+
+        const CFeeRate max_raw_tx_fee_rate{max_fee_rate};
+
+        const PackageMempoolAcceptResult package_result = [&] {
+            LOCK(::cs_main);
+            if (txns.size() > 1) return ProcessNewPackage(chainstate, mempool, txns, /*test_accept=*/true, /*client_maxfeerate=*/{});
+            return PackageMempoolAcceptResult(txns[0]->GetWitnessHash(), ProcessTransaction(chainman, txns[0], /*test_accept=*/true));
+        }();
+
+        std::vector<TestMempoolAcceptResult> results;
+        results.reserve(txns.size());
+
+        // We will check transaction fees while we iterate through txns in order. If any transaction fee
+        // exceeds maxfeerate, we will leave the rest of the validation results blank, because it
+        // doesn't make sense to return a validation result for a transaction if its ancestor(s) would
+        // not be submitted.
+        bool exit_early{false};
+        for (const auto& tx : txns) {
+            TestMempoolAcceptResult r;
+            r.txid = tx->GetHash().GetHex();
+            r.wtxid = tx->GetWitnessHash().GetHex();
+            if (package_result.m_state.GetResult() == PackageValidationResult::PCKG_POLICY) {
+                r.package_error = package_result.m_state.ToString();
+            }
+            auto it = package_result.m_tx_results.find(tx->GetWitnessHash());
+            if (exit_early || it == package_result.m_tx_results.end()) {
+                // Validation unfinished. Just return the txid and wtxid.
+                results.push_back(std::move(r));
+                continue;
+            }
+            const auto& tx_result = it->second;
+            // Package testmempoolaccept doesn't allow transactions to already be in the mempool.
+            CHECK_NONFATAL(tx_result.m_result_type != MempoolAcceptResult::ResultType::MEMPOOL_ENTRY);
+            r.validated = true;
+            if (tx_result.m_result_type == MempoolAcceptResult::ResultType::VALID) {
+                const CAmount fee = tx_result.m_base_fees.value();
+                const int64_t virtual_size = tx_result.m_vsize.value();
+                const CAmount max_raw_tx_fee = max_raw_tx_fee_rate.GetFee(virtual_size);
+                if (max_raw_tx_fee && fee > max_raw_tx_fee) {
+                    r.allowed = false;
+                    r.reject_reason = "max-fee-exceeded";
+                    exit_early = true;
+                } else {
+                    // Only return the fee and vsize if the tx would pass ATMP.
+                    r.allowed = true;
+                    r.vsize = virtual_size;
+                    TestMempoolAcceptFees fees;
+                    fees.base = fee;
+                    fees.effective_feerate = tx_result.m_effective_feerate.value().GetFeePerK();
+                    for (const auto& wtxid : tx_result.m_wtxids_fee_calculations.value()) {
+                        fees.effective_includes.push_back(wtxid.ToString());
+                    }
+                    r.fees = std::move(fees);
+                }
+            } else {
+                r.allowed = false;
+                const TxValidationState& state = tx_result.m_state;
+                if (state.GetResult() == TxValidationResult::TX_MISSING_INPUTS) {
+                    r.reject_reason = "missing-inputs";
+                } else {
+                    r.reject_reason = state.GetRejectReason();
+                    r.reject_details = state.ToString();
+                }
+            }
+            results.push_back(std::move(r));
+        }
+        return results;
     }
     SmartFeeEstimate estimateSmartFee(int conf_target, bool conservative) override
     {

@@ -23,6 +23,25 @@ interface NodeRpc $Proxy.wrap("interfaces::NodeRpc") {
     getBlock @8 (context :Proxy.Context, blockHash :Data) -> (result :Data);
     getTxOut @9 (context :Proxy.Context, txid :Data, n :UInt32, includeMempool :Bool) -> (result :TxOutInfo);
     getRawTransaction @10 (context :Proxy.Context, txid :Data, verbose :Bool, blockHash :Data) -> (result :RawTransactionResult);
+    testMempoolAccept @11 (context :Proxy.Context, txns :List(Data), maxFeeRate :Int64) -> (result :List(TestMempoolAcceptResult));
+}
+
+struct TestMempoolAcceptFees $Proxy.wrap("interfaces::TestMempoolAcceptFees") {
+    base @0 :Int64;
+    effectiveFeerate @1 :Int64 $Proxy.name("effective_feerate");
+    effectiveIncludes @2 :List(Text) $Proxy.name("effective_includes");
+}
+
+struct TestMempoolAcceptResult $Proxy.wrap("interfaces::TestMempoolAcceptResult") {
+    txid @0 :Text;
+    wtxid @1 :Text;
+    packageError @2 :Text $Proxy.name("package_error");
+    validated @3 :Bool;
+    allowed @4 :Bool;
+    rejectReason @5 :Text $Proxy.name("reject_reason");
+    rejectDetails @6 :Text $Proxy.name("reject_details");
+    vsize @7 :Int64;
+    fees @8 :TestMempoolAcceptFees;
 }
 
 struct TxScriptSig $Proxy.wrap("interfaces::TxScriptSig") {

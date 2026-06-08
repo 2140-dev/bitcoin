@@ -134,6 +134,24 @@ struct RawTransactionResult {
     std::optional<TransactionDetails> details;
 };
 
+struct TestMempoolAcceptFees {
+    int64_t base{0};
+    int64_t effective_feerate{0};
+    std::vector<std::string> effective_includes;
+};
+
+struct TestMempoolAcceptResult {
+    std::string txid;
+    std::string wtxid;
+    std::optional<std::string> package_error;
+    bool validated{false};
+    bool allowed{false};
+    std::optional<std::string> reject_reason;
+    std::optional<std::string> reject_details;
+    int64_t vsize{0};
+    std::optional<TestMempoolAcceptFees> fees;
+};
+
 struct NetworkInfoNetwork {
     std::string name;
     bool limited{false};
@@ -235,6 +253,12 @@ public:
     //! index, so confirmed txs need block_hash). Throws if not found. result.tx
     //! is the raw tx (verbosity 0); result.details is set when verbose (verbosity 1).
     virtual RawTransactionResult getRawTransaction(const uint256& txid, bool verbose, const std::optional<uint256>& block_hash) = 0;
+
+    //! Test whether the given transactions (1..MAX_PACKAGE_COUNT, as a package
+    //! when >1) would be accepted to the mempool, without submitting them.
+    //! max_fee_rate is in sat/kvB; 0 disables the max-fee check. One result per
+    //! input tx, in order. Mirrors testmempoolaccept.
+    virtual std::vector<TestMempoolAcceptResult> testMempoolAccept(const std::vector<CTransactionRef>& txns, int64_t max_fee_rate) = 0;
 
     //! Estimate the fee rate (sat/kvB) needed for confirmation within
     //! conf_target blocks, mirroring the estimatesmartfee RPC (applies the
