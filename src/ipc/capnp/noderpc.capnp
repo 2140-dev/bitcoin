@@ -22,6 +22,53 @@ interface NodeRpc $Proxy.wrap("interfaces::NodeRpc") {
     getBlockHeader @7 (context :Proxy.Context, blockHash :Data) -> (result :BlockHeaderInfo);
     getBlock @8 (context :Proxy.Context, blockHash :Data) -> (result :Data);
     getTxOut @9 (context :Proxy.Context, txid :Data, n :UInt32, includeMempool :Bool) -> (result :TxOutInfo);
+    getRawTransaction @10 (context :Proxy.Context, txid :Data, verbose :Bool, blockHash :Data) -> (result :RawTransactionResult);
+}
+
+struct TxScriptSig $Proxy.wrap("interfaces::TxScriptSig") {
+    scriptAsm @0 :Text $Proxy.name("script_asm");
+    hex @1 :Text;
+}
+
+struct TxInput $Proxy.wrap("interfaces::TxInput") {
+    coinbase @0 :Text;
+    txid @1 :Text;
+    vout @2 :UInt32;
+    scriptSig @3 :TxScriptSig $Proxy.name("script_sig");
+    txinwitness @4 :List(Text);
+    sequence @5 :UInt32;
+}
+
+struct TxOutput $Proxy.wrap("interfaces::TxOutput") {
+    value @0 :Int64;
+    n @1 :Int32;
+    scriptPubKey @2 :TxOutScriptPubKey $Proxy.name("script_pub_key");
+}
+
+struct TxBlockContext $Proxy.wrap("interfaces::TxBlockContext") {
+    blockhash @0 :Text;
+    confirmations @1 :Int32;
+    time @2 :Int64;
+    blocktime @3 :Int64;
+}
+
+struct TransactionDetails $Proxy.wrap("interfaces::TransactionDetails") {
+    txid @0 :Text;
+    hash @1 :Text;
+    version @2 :Int64;
+    size @3 :Int32;
+    vsize @4 :Int32;
+    weight @5 :Int32;
+    locktime @6 :Int64;
+    vin @7 :List(TxInput);
+    vout @8 :List(TxOutput);
+    inActiveChain @9 :Bool $Proxy.name("in_active_chain");
+    block @10 :TxBlockContext;
+}
+
+struct RawTransactionResult $Proxy.wrap("interfaces::RawTransactionResult") {
+    tx @0 :Data;
+    details @1 :TransactionDetails;
 }
 
 struct TxOutScriptPubKey $Proxy.wrap("interfaces::TxOutScriptPubKey") {

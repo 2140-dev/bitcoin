@@ -88,6 +88,52 @@ struct TxOutInfo {
     bool coinbase{false};
 };
 
+struct TxScriptSig {
+    std::string script_asm;
+    std::string hex;
+};
+
+struct TxInput {
+    std::optional<std::string> coinbase;
+    std::optional<std::string> txid;
+    uint32_t vout{0};
+    std::optional<TxScriptSig> script_sig;
+    std::vector<std::string> txinwitness;
+    uint32_t sequence{0};
+};
+
+struct TxOutput {
+    int64_t value{0};
+    int n{0};
+    TxOutScriptPubKey script_pub_key;
+};
+
+struct TxBlockContext {
+    std::string blockhash;
+    int confirmations{0};
+    int64_t time{0};
+    int64_t blocktime{0};
+};
+
+struct TransactionDetails {
+    std::string txid;
+    std::string hash;
+    int64_t version{0};
+    int size{0};
+    int vsize{0};
+    int weight{0};
+    int64_t locktime{0};
+    std::vector<TxInput> vin;
+    std::vector<TxOutput> vout;
+    bool in_active_chain{false};
+    std::optional<TxBlockContext> block;
+};
+
+struct RawTransactionResult {
+    CTransactionRef tx;
+    std::optional<TransactionDetails> details;
+};
+
 struct NetworkInfoNetwork {
     std::string name;
     bool limited{false};
@@ -184,6 +230,11 @@ public:
     //! spent in the mempool are treated as unavailable. The value is in
     //! satoshis. Mirrors gettxout.
     virtual std::optional<TxOutInfo> getTxOut(const uint256& txid, uint32_t n, bool include_mempool) = 0;
+
+    //! Transaction for the given txid, from the mempool or a given block (no tx
+    //! index, so confirmed txs need block_hash). Throws if not found. result.tx
+    //! is the raw tx (verbosity 0); result.details is set when verbose (verbosity 1).
+    virtual RawTransactionResult getRawTransaction(const uint256& txid, bool verbose, const std::optional<uint256>& block_hash) = 0;
 
     //! Estimate the fee rate (sat/kvB) needed for confirmation within
     //! conf_target blocks, mirroring the estimatesmartfee RPC (applies the

@@ -15,6 +15,7 @@
 #include <consensus/amount.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
+#include <consensus/consensus.h>
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <deploymentinfo.h>
@@ -103,6 +104,13 @@ using interfaces::BlockchainPruneInfo;
 using interfaces::BlockHeaderInfo;
 using interfaces::SmartFeeEstimate;
 using interfaces::TxOutInfo;
+using interfaces::TxOutScriptPubKey;
+using interfaces::RawTransactionResult;
+using interfaces::TransactionDetails;
+using interfaces::TxInput;
+using interfaces::TxOutput;
+using interfaces::TxScriptSig;
+using interfaces::TxBlockContext;
 using interfaces::DeploymentInfo;
 using interfaces::DeploymentsInfo;
 using interfaces::NetworkInfo;
@@ -998,6 +1006,81 @@ std::optional<int> GetPruneHeight(const BlockManager& blockman, const CChain& ch
     return CHECK_NONFATAL(first_unpruned.pprev)->nHeight;
 }
 
+TxOutScriptPubKey BuildScriptPubKey(const CScript& script)
+{
+    TxOutScriptPubKey spk;
+    UniValue o(UniValue::VOBJ);
+    ScriptToUniv(script, /*out=*/o, /*include_hex=*/true, /*include_address=*/true);
+    spk.script_asm = o["asm"].get_str();
+    spk.desc = o["desc"].get_str();
+    spk.hex = o["hex"].get_str();
+    spk.type = o["type"].get_str();
+    if (o.exists("address")) spk.address = o["address"].get_str();
+    return spk;
+}
+
+// Mirrors getrawtransaction verbosity 1 (TxToUniv at SHOW_DETAILS, no undo data,
+// plus the block context from TxToJSON). in_active_chain is meaningful only when
+// the caller supplied a block hash.
+TransactionDetails BuildTransactionDetails(const CTransaction& tx, const uint256& hash_block, bool in_active_chain, ChainstateManager& chainman) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    TransactionDetails d;
+    d.txid = tx.GetHash().GetHex();
+    d.hash = tx.GetWitnessHash().GetHex();
+    d.version = tx.version;
+    d.size = static_cast<int>(tx.ComputeTotalSize());
+    const int32_t weight = GetTransactionWeight(tx);
+    d.weight = weight;
+    d.vsize = (weight + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR;
+    d.locktime = tx.nLockTime;
+
+    for (const auto& txin : tx.vin) {
+        TxInput in;
+        if (tx.IsCoinBase()) {
+            in.coinbase = HexStr(txin.scriptSig);
+        } else {
+            in.txid = txin.prevout.hash.GetHex();
+            in.vout = txin.prevout.n;
+            TxScriptSig ss;
+            ss.script_asm = ScriptToAsmStr(txin.scriptSig, /*fAttemptSighashDecode=*/true);
+            ss.hex = HexStr(txin.scriptSig);
+            in.script_sig = std::move(ss);
+        }
+        if (!txin.scriptWitness.IsNull()) {
+            for (const auto& item : txin.scriptWitness.stack) {
+                in.txinwitness.push_back(HexStr(item));
+            }
+        }
+        in.sequence = txin.nSequence;
+        d.vin.push_back(std::move(in));
+    }
+
+    for (unsigned int i = 0; i < tx.vout.size(); ++i) {
+        const CTxOut& txout = tx.vout[i];
+        TxOutput out;
+        out.value = txout.nValue;
+        out.n = static_cast<int>(i);
+        out.script_pub_key = BuildScriptPubKey(txout.scriptPubKey);
+        d.vout.push_back(std::move(out));
+    }
+
+    d.in_active_chain = in_active_chain;
+
+    if (!hash_block.IsNull()) {
+        TxBlockContext ctx;
+        ctx.blockhash = hash_block.GetHex();
+        const CBlockIndex* pindex = chainman.m_blockman.LookupBlockIndex(hash_block);
+        if (pindex && chainman.ActiveChain().Contains(*pindex)) {
+            ctx.confirmations = 1 + chainman.ActiveChain().Height() - pindex->nHeight;
+            ctx.time = pindex->GetBlockTime();
+            ctx.blocktime = pindex->GetBlockTime();
+        }
+        d.block = std::move(ctx);
+    }
+
+    return d;
+}
+
 class NodeRpcImpl : public NodeRpc
 {
 public:
@@ -1141,17 +1224,50 @@ public:
             info.confirmations = pindex->nHeight - coin->nHeight + 1;
         }
         info.value = coin->out.nValue;
-
-        UniValue o(UniValue::VOBJ);
-        ScriptToUniv(coin->out.scriptPubKey, /*out=*/o, /*include_hex=*/true, /*include_address=*/true);
-        info.script_pub_key.script_asm = o["asm"].get_str();
-        info.script_pub_key.desc = o["desc"].get_str();
-        info.script_pub_key.hex = o["hex"].get_str();
-        info.script_pub_key.type = o["type"].get_str();
-        if (o.exists("address")) info.script_pub_key.address = o["address"].get_str();
-
+        info.script_pub_key = BuildScriptPubKey(coin->out.scriptPubKey);
         info.coinbase = coin->IsCoinBase();
         return info;
+    }
+    RawTransactionResult getRawTransaction(const uint256& txid, bool verbose, const std::optional<uint256>& block_hash) override
+    {
+        ChainstateManager& chainman = *Assert(m_node.chainman);
+
+        if (txid == chainman.GetParams().GenesisBlock().hashMerkleRoot) {
+            // Special exception for the genesis block coinbase transaction.
+            throw std::runtime_error("The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved");
+        }
+
+        const CBlockIndex* blockindex = nullptr;
+        if (block_hash) {
+            LOCK(::cs_main);
+            blockindex = chainman.m_blockman.LookupBlockIndex(*block_hash);
+            if (!blockindex) {
+                throw std::runtime_error("Block hash not found");
+            }
+        }
+
+        uint256 hash_block;
+        const CTransactionRef tx = GetTransaction(blockindex, m_node.mempool.get(), Txid::FromUint256(txid), chainman.m_blockman, hash_block);
+        if (!tx) {
+            if (blockindex) {
+                const bool block_has_data = WITH_LOCK(::cs_main, return blockindex->nStatus & BLOCK_HAVE_DATA);
+                if (!block_has_data) {
+                    throw std::runtime_error("Block not available");
+                }
+                throw std::runtime_error("No such transaction found in the provided block");
+            }
+            // No tx index: a confirmed tx can only be found via its block hash.
+            throw std::runtime_error("No such mempool transaction. Provide a block hash to look it up in a specific block");
+        }
+
+        RawTransactionResult result;
+        result.tx = tx;
+        if (verbose) {
+            LOCK(::cs_main);
+            const bool in_active_chain = blockindex && chainman.ActiveChain().Contains(*blockindex);
+            result.details = BuildTransactionDetails(*tx, hash_block, in_active_chain, chainman);
+        }
+        return result;
     }
     SmartFeeEstimate estimateSmartFee(int conf_target, bool conservative) override
     {
