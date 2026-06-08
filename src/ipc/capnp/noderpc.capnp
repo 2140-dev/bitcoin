@@ -24,6 +24,7 @@ interface NodeRpc $Proxy.wrap("interfaces::NodeRpc") {
     getTxOut @9 (context :Proxy.Context, txid :Data, n :UInt32, includeMempool :Bool) -> (result :TxOutInfo);
     getRawTransaction @10 (context :Proxy.Context, txid :Data, verbose :Bool, blockHash :Data) -> (result :RawTransactionResult);
     testMempoolAccept @11 (context :Proxy.Context, txns :List(Data), maxFeeRate :Int64) -> (result :List(TestMempoolAcceptResult));
+    sendRawTransaction @12 (context :Proxy.Context, tx :Data, maxFeeRate :Int64, maxBurnAmount :Int64) -> (result :Text);
 }
 
 struct TestMempoolAcceptFees $Proxy.wrap("interfaces::TestMempoolAcceptFees") {

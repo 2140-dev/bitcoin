@@ -260,6 +260,13 @@ public:
     //! input tx, in order. Mirrors testmempoolaccept.
     virtual std::vector<TestMempoolAcceptResult> testMempoolAccept(const std::vector<CTransactionRef>& txns, int64_t max_fee_rate) = 0;
 
+    //! Submit a transaction to the mempool and broadcast it (or, with
+    //! -privatebroadcast, send it only over privacy networks). max_fee_rate is
+    //! in sat/kvB (0 accepts any fee rate); max_burn_amount is in sat (outputs
+    //! provably unspendable above this are rejected). Returns the txid (hex) on
+    //! success, throws on failure. Mirrors the sendrawtransaction RPC.
+    virtual std::string sendRawTransaction(const CTransactionRef& tx, int64_t max_fee_rate, int64_t max_burn_amount) = 0;
+
     //! Estimate the fee rate (sat/kvB) needed for confirmation within
     //! conf_target blocks, mirroring the estimatesmartfee RPC (applies the
     //! mempool/relay fee floor and reports the target actually used).

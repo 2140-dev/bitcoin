@@ -11,6 +11,7 @@
 #include <clientversion.h>
 #include <coins.h>
 #include <common/args.h>
+#include <common/messages.h>
 #include <common/settings.h>
 #include <consensus/amount.h>
 #include <consensus/merkle.h>
@@ -1283,6 +1284,10 @@ public:
         ChainstateManager& chainman = *Assert(m_node.chainman);
         Chainstate& chainstate = chainman.ActiveChainstate();
 
+        // Matches ParseFeeRate in the RPC: reject fee rates >= 1 BTC/kvB. 0 means "any".
+        if (max_fee_rate >= COIN) {
+            throw std::runtime_error("Fee rates larger than or equal to 1BTC/kvB are not accepted");
+        }
         const CFeeRate max_raw_tx_fee_rate{max_fee_rate};
 
         const PackageMempoolAcceptResult package_result = [&] {
@@ -1349,6 +1354,42 @@ public:
             results.push_back(std::move(r));
         }
         return results;
+    }
+    std::string sendRawTransaction(const CTransactionRef& tx, int64_t max_fee_rate, int64_t max_burn_amount) override
+    {
+        for (const auto& out : tx->vout) {
+            if ((out.scriptPubKey.IsUnspendable() || !out.scriptPubKey.HasValidOps()) && out.nValue > max_burn_amount) {
+                throw std::runtime_error(common::TransactionErrorString(TransactionError::MAX_BURN_EXCEEDED).original);
+            }
+        }
+
+        // Matches ParseFeeRate in the RPC: reject fee rates >= 1 BTC/kvB. 0 means "any".
+        if (max_fee_rate >= COIN) {
+            throw std::runtime_error("Fee rates larger than or equal to 1BTC/kvB are not accepted");
+        }
+        const CFeeRate max_raw_tx_fee_rate{max_fee_rate};
+        const int64_t virtual_size = GetVirtualTransactionSize(*tx);
+        const CAmount max_raw_tx_fee = max_raw_tx_fee_rate.GetFee(virtual_size);
+
+        const bool private_broadcast_enabled{m_node.args && m_node.args->GetBoolArg("-privatebroadcast", DEFAULT_PRIVATE_BROADCAST)};
+        if (private_broadcast_enabled &&
+            !g_reachable_nets.Contains(NET_ONION) &&
+            !g_reachable_nets.Contains(NET_I2P)) {
+            throw std::runtime_error(
+                "-privatebroadcast is enabled, but none of the Tor or I2P networks is "
+                "reachable. Maybe the location of the Tor proxy couldn't be retrieved "
+                "from the Tor daemon at startup. Check whether the Tor daemon is running "
+                "and that -torcontrol, -torpassword and -i2psam are configured properly.");
+        }
+        const auto method = private_broadcast_enabled ? TxBroadcast::NO_MEMPOOL_PRIVATE_BROADCAST
+                                                      : TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL;
+
+        std::string err_string;
+        const TransactionError err = BroadcastTransaction(m_node, tx, err_string, max_raw_tx_fee, method, /*wait_callback=*/true);
+        if (TransactionError::OK != err) {
+            throw std::runtime_error(err_string.empty() ? common::TransactionErrorString(err).original : err_string);
+        }
+        return tx->GetHash().GetHex();
     }
     SmartFeeEstimate estimateSmartFee(int conf_target, bool conservative) override
     {
