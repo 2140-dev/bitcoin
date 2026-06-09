@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <arith_uint256.h>
 #include <banman.h>
 #include <block_validation.h>
 #include <btcsignals.h>
@@ -14,13 +15,13 @@
 #include <common/messages.h>
 #include <common/settings.h>
 #include <consensus/amount.h>
+#include <consensus/consensus.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
-#include <consensus/consensus.h>
 #include <consensus/validation.h>
 #include <core_io.h>
+#include <crypto/hex_base.h>
 #include <deploymentinfo.h>
-#include <deploymentstatus.h>
 #include <init.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
@@ -32,6 +33,7 @@
 #include <key.h>
 #include <logging.h>
 #include <mapport.h>
+#include <mempool_validation.h>
 #include <net.h>
 #include <net_processing.h>
 #include <net_types.h>
@@ -48,27 +50,25 @@
 #include <node/mining_types.h>
 #include <node/protocol_version.h>
 #include <node/transaction.h>
-#include <mempool_validation.h>
 #include <node/types.h>
 #include <node/warnings.h>
 #include <policy/feerate.h>
-#include <policy/packages.h>
 #include <policy/fees/block_policy_estimator.h>
+#include <policy/packages.h>
 #include <policy/policy.h>
 #include <policy/rbf.h>
-#include <arith_uint256.h>
 #include <pow.h>
 #include <primitives/block.h>
+#include <primitives/transaction.h>
 #include <protocol.h>
 #include <script/interpreter.h>
-#include <primitives/transaction.h>
+#include <script/script.h>
 #include <sync.h>
 #include <tinyformat.h>
-#include <util/chaintype.h>
-#include <util/strencodings.h>
 #include <txmempool.h>
 #include <uint256.h>
 #include <univalue.h>
+#include <util/chaintype.h>
 #include <util/check.h>
 #include <util/result.h>
 #include <util/signalinterrupt.h>
@@ -76,8 +76,10 @@
 #include <util/time.h>
 #include <util/translation.h>
 #include <validationinterface.h>
+#include <versionbits.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -86,42 +88,44 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
 
-using interfaces::BlockRef;
-using interfaces::BlockTemplate;
-using interfaces::BlockTip;
-using interfaces::Chain;
-using interfaces::FoundBlock;
-using interfaces::Handler;
-using interfaces::MakeSignalHandler;
-using interfaces::Mining;
-using interfaces::Node;
 using interfaces::BIP9DeploymentInfo;
 using interfaces::BIP9Statistics;
 using interfaces::BlockchainInfo;
 using interfaces::BlockchainPruneInfo;
 using interfaces::BlockHeaderInfo;
-using interfaces::SmartFeeEstimate;
-using interfaces::TxOutInfo;
-using interfaces::TxOutScriptPubKey;
-using interfaces::RawTransactionResult;
-using interfaces::TransactionDetails;
-using interfaces::TxInput;
-using interfaces::TxOutput;
-using interfaces::TxScriptSig;
-using interfaces::TxBlockContext;
-using interfaces::TestMempoolAcceptResult;
-using interfaces::TestMempoolAcceptFees;
+using interfaces::BlockRef;
+using interfaces::BlockTemplate;
+using interfaces::BlockTip;
+using interfaces::Chain;
 using interfaces::DeploymentInfo;
 using interfaces::DeploymentsInfo;
+using interfaces::FoundBlock;
+using interfaces::Handler;
+using interfaces::MakeSignalHandler;
+using interfaces::Mining;
 using interfaces::NetworkInfo;
 using interfaces::NetworkInfoLocalAddress;
 using interfaces::NetworkInfoNetwork;
+using interfaces::Node;
 using interfaces::NodeRpc;
+using interfaces::RawTransactionResult;
+using interfaces::SmartFeeEstimate;
+using interfaces::TestMempoolAcceptFees;
+using interfaces::TestMempoolAcceptResult;
+using interfaces::TransactionDetails;
+using interfaces::TxBlockContext;
+using interfaces::TxInput;
+using interfaces::TxOutInfo;
+using interfaces::TxOutput;
+using interfaces::TxOutScriptPubKey;
+using interfaces::TxScriptSig;
 using node::BlockAssembler;
 using node::BlockCreateOptions;
 using node::BlockWaitOptions;
@@ -429,7 +433,9 @@ bool FillBlock(const CBlockIndex* index, const FoundBlock& block, UniqueLock<Rec
     if (block.m_max_time) *block.m_max_time = index->GetBlockTimeMax();
     if (block.m_mtp_time) *block.m_mtp_time = index->GetMedianTimePast();
     if (block.m_in_active_chain) *block.m_in_active_chain = active[index->nHeight] == index;
-    if (block.m_locator) { *block.m_locator = GetLocator(index); }
+    if (block.m_locator) {
+        *block.m_locator = GetLocator(index);
+    }
     if (block.m_next_block) FillBlock(active[index->nHeight] == index ? active[index->nHeight + 1] : nullptr, *block.m_next_block, lock, active, blockman);
     if (block.m_data) {
         REVERSE_LOCK(lock, cs_main);
@@ -606,9 +612,9 @@ public:
         return m_node.mempool->HasDescendants(txid);
     }
     bool broadcastTransaction(const CTransactionRef& tx,
-        const CAmount& max_tx_fee,
-        TxBroadcast broadcast_method,
-        std::string& err_string) override
+                              const CAmount& max_tx_fee,
+                              TxBroadcast broadcast_method,
+                              std::string& err_string) override
     {
         const TransactionError err = BroadcastTransaction(m_node, tx, err_string, max_tx_fee, broadcast_method, /*wait_callback=*/false);
         // Chain clients only care about failures to accept the tx to the mempool. Disregard non-mempool related failures.
@@ -922,7 +928,8 @@ public:
                                                        chainman().ActiveChainstate(),
                                                        m_node.mempool.get(),
                                                        create_options,
-                                                   }.CreateNewBlock(),
+                                                   }
+                                                       .CreateNewBlock(),
                                                    m_node);
     }
 
@@ -1381,8 +1388,7 @@ public:
                 "from the Tor daemon at startup. Check whether the Tor daemon is running "
                 "and that -torcontrol, -torpassword and -i2psam are configured properly.");
         }
-        const auto method = private_broadcast_enabled ? TxBroadcast::NO_MEMPOOL_PRIVATE_BROADCAST
-                                                      : TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL;
+        const auto method = private_broadcast_enabled ? TxBroadcast::NO_MEMPOOL_PRIVATE_BROADCAST : TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL;
 
         std::string err_string;
         const TransactionError err = BroadcastTransaction(m_node, tx, err_string, max_raw_tx_fee, method, /*wait_callback=*/true);
