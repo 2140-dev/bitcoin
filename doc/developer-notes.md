@@ -1139,19 +1139,6 @@ to check a subtree directory for consistency with its upstream repository.
 
 The tool instructions also include a list of the subtrees managed by Bitcoin Core.
 
-To fully verify or update a subtree, add it as a remote:
-
-```sh
-git remote add libmultiprocess https://github.com/bitcoin-core/libmultiprocess.git
-```
-
-To update the subtree:
-
-```sh
-git fetch libmultiprocess
-git subtree pull --prefix=src/ipc/libmultiprocess libmultiprocess master --squash
-```
-
 The ultimate upstream of the few externally managed subtrees are:
 
 - src/leveldb
@@ -1410,7 +1397,6 @@ there are [`interfaces::Chain`](../src/interfaces/chain.h), used to
 access the node's latest chain state,
 [`interfaces::Node`](../src/interfaces/node.h), used to control the
 node, and [`interfaces::Mining`](../src/interfaces/mining.h),
->>>>>>> acdcd09526 (nuke: wallet + psbt + external-signer (src, build, deps, ci, tests, docs))
 used by RPC to generate block templates. There are also more specialized interface
 types like [`interfaces::Handler`](../src/interfaces/handler.h) passed to and from
 various interface methods.
