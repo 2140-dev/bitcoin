@@ -13,6 +13,7 @@
 #include <common/settings.h>
 #include <consensus/amount.h>
 #include <consensus/merkle.h>
+#include <consensus/params.h>
 #include <consensus/validation.h>
 #include <init.h>
 #include <interfaces/chain.h>
@@ -47,6 +48,7 @@
 #include <policy/rbf.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
+#include <scheduler.h>
 #include <sync.h>
 #include <txmempool.h>
 #include <uint256.h>
@@ -59,15 +61,22 @@
 #include <util/translation.h>
 #include <validationinterface.h>
 
+#include <algorithm>
 #include <atomic>
+#include <compare>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <numeric>
 #include <optional>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -78,6 +87,7 @@ using interfaces::BlockTip;
 using interfaces::Chain;
 using interfaces::FoundBlock;
 using interfaces::Handler;
+using interfaces::MakeCleanupHandler;
 using interfaces::MakeSignalHandler;
 using interfaces::Mining;
 using interfaces::Node;
@@ -753,14 +763,135 @@ public:
     NodeContext& m_node;
 };
 
+class MiningTaskRunner
+{
+    struct TaskState {
+        std::atomic_bool cancelled{false};
+        std::function<void()> cancel;
+    };
+
+    struct Task {
+        std::shared_ptr<TaskState> state;
+        std::function<void(std::atomic_bool& cancelled)> task;
+    };
+
+public:
+    explicit MiningTaskRunner(size_t worker_count = 1)
+    {
+        worker_count = std::max<size_t>(1, worker_count);
+        m_workers.reserve(worker_count);
+        for (size_t i{0}; i < worker_count; ++i) {
+            m_workers.emplace_back([this] { WorkLoop(); });
+        }
+    }
+
+    ~MiningTaskRunner()
+    {
+        std::vector<std::shared_ptr<TaskState>> states;
+        {
+            std::lock_guard lock{m_mutex};
+            m_stop = true;
+            states = m_states;
+        }
+        for (const auto& state : states) {
+            Cancel(*state);
+        }
+        m_cv.notify_all();
+        for (auto& worker : m_workers) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+
+    std::unique_ptr<Handler> schedule(std::function<void(std::atomic_bool& cancelled)> task, std::function<void()> cancel = {})
+    {
+        auto state{std::make_shared<TaskState>()};
+        state->cancel = std::move(cancel);
+        {
+            std::lock_guard lock{m_mutex};
+            if (m_stop) {
+                state->cancelled.store(true, std::memory_order_release);
+            } else {
+                m_states.push_back(state);
+                m_tasks.push_back({state, std::move(task)});
+            }
+        }
+        m_cv.notify_one();
+        return MakeCleanupHandler([state] {
+            Cancel(*state);
+        });
+    }
+
+private:
+    static void Cancel(TaskState& state) noexcept
+    {
+        if (state.cancelled.exchange(true, std::memory_order_acq_rel) || !state.cancel) return;
+        try {
+            state.cancel();
+        } catch (const std::exception& e) {
+            LogError("Mining task cancellation failed: %s\n", e.what());
+        } catch (...) {
+            LogError("Mining task cancellation failed with an unknown exception\n");
+        }
+    }
+
+    void WorkLoop()
+    {
+        while (true) {
+            Task task;
+            {
+                std::unique_lock lock{m_mutex};
+                m_cv.wait(lock, [&] { return m_stop || !m_tasks.empty(); });
+                if (m_stop && m_tasks.empty()) return;
+                task = std::move(m_tasks.front());
+                m_tasks.pop_front();
+            }
+            if (!task.state->cancelled.load(std::memory_order_acquire)) {
+                try {
+                    task.task(task.state->cancelled);
+                } catch (const std::exception& e) {
+                    LogError("Mining task failed: %s\n", e.what());
+                } catch (...) {
+                    LogError("Mining task failed with an unknown exception\n");
+                }
+            }
+            {
+                std::lock_guard lock{m_mutex};
+                std::erase(m_states, task.state);
+            }
+        }
+    }
+
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    std::deque<Task> m_tasks;
+    std::vector<std::shared_ptr<TaskState>> m_states;
+    std::vector<std::thread> m_workers;
+    bool m_stop{false};
+};
+
+CAmount TotalTemplateFees(const CBlockTemplate& block_template)
+{
+    return std::accumulate(block_template.vTxFees.begin(), block_template.vTxFees.end(), CAmount{0});
+}
+
+bool ShouldCreateMinDifficultyTemplate(ChainstateManager& chainman)
+{
+    if (!chainman.GetParams().GetConsensus().fPowAllowMinDifficultyBlocks) return false;
+    LOCK(::cs_main);
+    const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+    return tip && NodeClock::now() > NodeClock::time_point{std::chrono::seconds{tip->GetBlockTime()}} + std::chrono::minutes{20};
+}
+
 class BlockTemplateImpl : public BlockTemplate
 {
 public:
     explicit BlockTemplateImpl(BlockCreateOptions create_options,
                                std::unique_ptr<CBlockTemplate> block_template,
-                               const NodeContext& node) : m_create_options(std::move(create_options)),
-                                                          m_block_template(std::move(block_template)),
-                                                          m_node(node)
+                               NodeContext& node,
+                               std::shared_ptr<MiningTaskRunner> task_runner) : m_create_options(std::move(create_options)),
+                                                                                m_block_template(std::move(block_template)),
+                                                                                m_task_runner(std::move(task_runner)),
+                                                                                m_node(node)
     {
         assert(m_block_template);
     }
@@ -795,46 +926,172 @@ public:
         return TransactionMerklePath(m_block_template->block, 0);
     }
 
-    bool submitSolution(uint32_t version, uint32_t timestamp, uint32_t nonce, CTransactionRef coinbase) override
+    std::unique_ptr<Handler> submitSolutionAsync(uint32_t version, uint32_t timestamp, uint32_t nonce, CTransactionRef coinbase, SubmitSolutionFn fn) override
     {
-        AddMerkleRootAndCoinbase(m_block_template->block, std::move(coinbase), version, timestamp, nonce);
-        std::string reason;
-        std::string debug;
-        return SubmitBlock(chainman(), std::make_shared<const CBlock>(m_block_template->block), /*new_block=*/nullptr, reason, debug);
+        auto block{m_block_template->block};
+        return m_task_runner->schedule([node = &m_node, block = std::move(block), version, timestamp, nonce, coinbase = std::move(coinbase), fn = std::move(fn)](std::atomic_bool& cancelled) mutable {
+            if (cancelled.load(std::memory_order_acquire)) return;
+            AddMerkleRootAndCoinbase(block, std::move(coinbase), version, timestamp, nonce);
+            std::string reason;
+            std::string debug;
+            const bool accepted{SubmitBlock(*Assert(node->chainman), std::make_shared<const CBlock>(block), /*new_block=*/nullptr, reason, debug)};
+            if (!cancelled.load(std::memory_order_acquire)) fn(accepted);
+        });
     }
 
-    std::unique_ptr<BlockTemplate> waitNext(BlockWaitOptions options) override
+    std::unique_ptr<Handler> watchNext(BlockWaitOptions options, NextTemplateFn fn) override
     {
-        auto new_template = WaitAndCreateNewBlock(chainman(),
-                                                  notifications(),
-                                                  m_node.mempool.get(),
-                                                  m_block_template,
-                                                  /*wait_options=*/options,
-                                                  /*create_options=*/m_create_options,
-                                                  /*interrupt_wait=*/m_interrupt_wait);
-        if (new_template) return std::make_unique<BlockTemplateImpl>(m_create_options, std::move(new_template), m_node);
-        return nullptr;
-    }
+        struct WatchState : std::enable_shared_from_this<WatchState> {
+            std::atomic_bool done{false};
+            btcsignals::connection tip_connection;
+            std::shared_ptr<MiningTaskRunner> task_runner;
+            std::mutex task_mutex;
+            std::vector<std::shared_ptr<std::unique_ptr<Handler>>> tasks;
+            NodeContext* node{nullptr};
+            BlockCreateOptions create_options;
+            uint256 current_prev_hash;
+            CAmount current_fees{0};
+            BlockWaitOptions options;
+            NextTemplateFn fn;
 
-    void interruptWait() override
-    {
-        InterruptWait(notifications(), m_interrupt_wait);
+            void complete(std::unique_ptr<CBlockTemplate> block_template)
+            {
+                if (done.exchange(true, std::memory_order_acq_rel)) return;
+                tip_connection.disconnect();
+                {
+                    std::vector<std::shared_ptr<std::unique_ptr<Handler>>> tasks;
+                    {
+                        std::lock_guard lock{task_mutex};
+                        tasks.swap(this->tasks);
+                    }
+                    tasks.clear();
+                }
+                if (!fn) return;
+                if (block_template) {
+                    fn(std::make_unique<BlockTemplateImpl>(create_options, std::move(block_template), *node, task_runner));
+                } else {
+                    fn(nullptr);
+                }
+            }
+
+            bool should_refresh(bool tip_changed) const
+            {
+                return tip_changed || ShouldCreateMinDifficultyTemplate(*Assert(node->chainman));
+            }
+
+            void check(bool tip_changed, bool complete_on_miss = false)
+            {
+                if (done.load(std::memory_order_acquire)) return;
+                if (!tip_changed && options.fee_threshold == MAX_MONEY && !should_refresh(/*tip_changed=*/false)) {
+                    if (complete_on_miss) complete(nullptr);
+                    return;
+                }
+
+                auto holder{std::make_shared<std::unique_ptr<Handler>>()};
+                auto handler{task_runner->schedule([state = shared_from_this(), holder, tip_changed, complete_on_miss](std::atomic_bool& cancelled) {
+                    auto cleanup{[holder] {
+                        holder->reset();
+                    }};
+                    if (cancelled.load(std::memory_order_acquire) || state->done.load(std::memory_order_acquire)) return cleanup();
+                    const bool refresh{state->should_refresh(tip_changed)};
+                    auto new_template{BlockAssembler{
+                        Assert(state->node->chainman)->ActiveChainstate(),
+                        state->node->mempool.get(),
+                        state->create_options}
+                                          .CreateNewBlock()};
+                    if (cancelled.load(std::memory_order_acquire) || state->done.load(std::memory_order_acquire)) return cleanup();
+                    if (refresh) {
+                        state->complete(std::move(new_template));
+                        return cleanup();
+                    }
+
+                    const CAmount new_fees{TotalTemplateFees(*new_template)};
+                    if (new_fees >= state->current_fees + state->options.fee_threshold) {
+                        state->complete(std::move(new_template));
+                    } else if (complete_on_miss) {
+                        state->complete(nullptr);
+                    }
+                    cleanup();
+                })};
+                *holder = std::move(handler);
+                if (done.load(std::memory_order_acquire)) {
+                    holder->reset();
+                    return;
+                }
+                std::lock_guard lock{task_mutex};
+                std::erase_if(tasks, [](const auto& task) { return !*task; });
+                if (done.load(std::memory_order_acquire)) {
+                    holder->reset();
+                } else {
+                    tasks.push_back(std::move(holder));
+                }
+            }
+
+            void schedule_fee_tick()
+            {
+                if (done.load(std::memory_order_acquire) || options.fee_threshold == MAX_MONEY) return;
+                Assert(node->scheduler)->schedule([state = shared_from_this()] {
+                    if (state->done.load(std::memory_order_acquire)) return;
+                    state->check(/*tip_changed=*/false);
+                    state->schedule_fee_tick();
+                },
+                                                  std::chrono::steady_clock::now() + std::chrono::seconds{1});
+            }
+
+            void schedule_timeout()
+            {
+                if (options.timeout >= std::chrono::years{100}) return;
+                Assert(node->scheduler)->schedule([state = shared_from_this()] {
+                    if (state->options.fee_threshold < MAX_MONEY || state->should_refresh(/*tip_changed=*/false)) {
+                        state->check(/*tip_changed=*/false, /*complete_on_miss=*/true);
+                    } else {
+                        state->complete(nullptr);
+                    }
+                },
+                                                  std::chrono::time_point_cast<std::chrono::steady_clock::duration>(std::chrono::steady_clock::now() + options.timeout));
+            }
+        };
+
+        auto state{std::make_shared<WatchState>()};
+        state->task_runner = m_task_runner;
+        state->node = &m_node;
+        state->create_options = m_create_options;
+        state->current_prev_hash = m_block_template->block.hashPrevBlock;
+        state->current_fees = TotalTemplateFees(*m_block_template);
+        state->options = options;
+        state->fn = std::move(fn);
+        state->tip_connection = ::uiInterface.NotifyBlockTip_connect([state](SynchronizationState, const CBlockIndex& block, double) {
+            if (block.GetBlockHash() != state->current_prev_hash) state->check(/*tip_changed=*/true);
+        });
+        if (const auto tip{GetTip(*Assert(m_node.chainman))}; tip && tip->hash != state->current_prev_hash) {
+            state->check(/*tip_changed=*/true);
+        }
+        state->check(/*tip_changed=*/false, /*complete_on_miss=*/options.timeout <= MillisecondsDouble{0});
+        state->schedule_fee_tick();
+        if (options.timeout > MillisecondsDouble{0}) state->schedule_timeout();
+        return MakeCleanupHandler([state] {
+            state->done.store(true, std::memory_order_release);
+            state->tip_connection.disconnect();
+            std::vector<std::shared_ptr<std::unique_ptr<Handler>>> tasks;
+            {
+                std::lock_guard lock{state->task_mutex};
+                tasks.swap(state->tasks);
+            }
+        });
     }
 
     const BlockCreateOptions m_create_options;
 
     const std::unique_ptr<CBlockTemplate> m_block_template;
 
-    bool m_interrupt_wait{false};
-    ChainstateManager& chainman() { return *Assert(m_node.chainman); }
-    KernelNotifications& notifications() { return *Assert(m_node.notifications); }
-    const NodeContext& m_node;
+    std::shared_ptr<MiningTaskRunner> m_task_runner;
+    NodeContext& m_node;
 };
 
 class MinerImpl : public Mining
 {
 public:
-    explicit MinerImpl(const NodeContext& node) : m_node(node) {}
+    explicit MinerImpl(NodeContext& node) : m_task_runner(std::make_shared<MiningTaskRunner>()), m_node(node) {}
 
     bool isTestChain() override
     {
@@ -851,15 +1108,77 @@ public:
         return GetTip(chainman());
     }
 
-    std::optional<BlockRef> waitTipChanged(uint256 current_tip, MillisecondsDouble timeout) override
+    std::unique_ptr<Handler> watchTip(uint256 current_tip, MillisecondsDouble timeout, TipChangedFn fn) override
     {
-        return WaitTipChanged(chainman(), notifications(), current_tip, timeout, m_interrupt_mining);
+        struct WatchState {
+            std::atomic_bool done{false};
+            btcsignals::connection tip_connection;
+            NodeContext* node{nullptr};
+            uint256 current_tip;
+            TipChangedFn fn;
+
+            void complete(std::optional<BlockRef> tip)
+            {
+                if (done.exchange(true, std::memory_order_acq_rel)) return;
+                tip_connection.disconnect();
+                if (fn) fn(std::move(tip));
+            }
+        };
+
+        auto state{std::make_shared<WatchState>()};
+        state->node = &m_node;
+        state->current_tip = current_tip;
+        state->fn = std::move(fn);
+
+        if (auto tip{getTip()}; tip && tip->hash != current_tip) {
+            Assert(m_node.scheduler)->schedule([state, tip] {
+                state->complete(tip);
+            },
+                                               std::chrono::steady_clock::now());
+        } else {
+            state->tip_connection = ::uiInterface.NotifyBlockTip_connect([state](SynchronizationState, const CBlockIndex& block, double) {
+                const BlockRef tip{block.GetBlockHash(), block.nHeight};
+                if (tip.hash != state->current_tip) state->complete(tip);
+            });
+            if (timeout < std::chrono::years{100}) {
+                Assert(m_node.scheduler)->schedule([state] {
+                    state->complete(GetTip(*Assert(state->node->chainman)));
+                },
+                                                   std::chrono::time_point_cast<std::chrono::steady_clock::duration>(std::chrono::steady_clock::now() + timeout));
+            }
+        }
+
+        return MakeCleanupHandler([state] {
+            state->done.store(true, std::memory_order_release);
+            state->tip_connection.disconnect();
+        });
     }
 
-    std::unique_ptr<BlockTemplate> createNewBlock(const BlockCreateOptions& options, bool cooldown) override
+    std::unique_ptr<Handler> createNewBlockAsync(const BlockCreateOptions& options, bool cooldown, CreateBlockFn fn) override
+    {
+        return m_task_runner->schedule([this, options, cooldown, fn = std::move(fn)](std::atomic_bool& cancelled) mutable {
+            try {
+                auto block_template{CreateNewBlock(options, cooldown, cancelled)};
+                if (!cancelled.load(std::memory_order_acquire)) fn(CreateBlockResult{std::move(block_template)});
+            } catch (const std::exception& e) {
+                LogError("CreateNewBlock failed: %s\n", e.what());
+                if (!cancelled.load(std::memory_order_acquire)) fn(util::Error{Untranslated(e.what())});
+            } catch (...) {
+                LogError("CreateNewBlock failed with an unknown exception\n");
+                if (!cancelled.load(std::memory_order_acquire)) fn(util::Error{Untranslated("unknown CreateNewBlock failure")});
+            }
+        }, [this] {
+            auto& notifications{*Assert(m_node.notifications)};
+            LOCK(notifications.m_tip_block_mutex);
+            notifications.m_tip_block_cv.notify_all();
+        });
+    }
+
+    std::unique_ptr<BlockTemplate> CreateNewBlock(const BlockCreateOptions& options, bool cooldown, std::atomic_bool& cancelled)
     {
         // Ensure m_tip_block is set so consumers of BlockTemplate can rely on that.
-        std::optional<BlockRef> maybe_tip{waitTipChanged(uint256::ZERO, MillisecondsDouble::max())};
+        MillisecondsDouble startup_timeout{MillisecondsDouble::max()};
+        std::optional<BlockRef> maybe_tip{WaitTipChanged(chainman(), notifications(), uint256::ZERO, startup_timeout, cancelled)};
 
         if (!maybe_tip) return {};
 
@@ -870,54 +1189,57 @@ public:
             // because on regtest and single miner signets this would wait
             // forever if no block was mined in the past day.
             while (chainman().IsInitialBlockDownload()) {
-                maybe_tip = waitTipChanged(maybe_tip->hash, MillisecondsDouble{1000});
-                if (!maybe_tip || chainman().m_interrupt || WITH_LOCK(notifications().m_tip_block_mutex, return m_interrupt_mining)) return {};
+                MillisecondsDouble timeout{1000};
+                maybe_tip = WaitTipChanged(chainman(), notifications(), maybe_tip->hash, timeout, cancelled);
+                if (!maybe_tip || chainman().m_interrupt || cancelled.load(std::memory_order_acquire)) return {};
             }
 
             // Also wait during the final catch-up moments after IBD.
-            if (!CooldownIfHeadersAhead(chainman(), notifications(), *maybe_tip, m_interrupt_mining)) return {};
+            if (!CooldownIfHeadersAhead(chainman(), notifications(), *maybe_tip, cancelled)) return {};
         }
         const BlockCreateOptions create_options{MergeMiningOptions(options, m_node.mining_args)};
+        if (cancelled.load(std::memory_order_acquire)) return {};
         return std::make_unique<BlockTemplateImpl>(create_options,
                                                    BlockAssembler{
                                                        chainman().ActiveChainstate(),
                                                        m_node.mempool.get(),
                                                        create_options,
                                                    }.CreateNewBlock(),
-                                                   m_node);
+                                                   m_node,
+                                                   m_task_runner);
     }
 
-    void interrupt() override
+    std::unique_ptr<Handler> checkBlockAsync(CBlock block, node::BlockCheckOptions options, CheckBlockFn fn) override
     {
-        InterruptWait(notifications(), m_interrupt_mining);
+        return m_task_runner->schedule([this, block = std::move(block), options, fn = std::move(fn)](std::atomic_bool& cancelled) mutable {
+            if (cancelled.load(std::memory_order_acquire)) return;
+            LOCK(chainman().GetMutex());
+            BlockValidationState state{TestBlockValidity(chainman().ActiveChainstate(), block, /*check_pow=*/options.check_pow, /*check_merkle_root=*/options.check_merkle_root)};
+            if (!cancelled.load(std::memory_order_acquire)) fn(state.IsValid(), state.GetRejectReason(), state.GetDebugMessage());
+        });
     }
 
-    bool checkBlock(const CBlock& block, const node::BlockCheckOptions& options, std::string& reason, std::string& debug) override
+    std::unique_ptr<Handler> submitBlockAsync(CBlock block_in, SubmitBlockFn fn) override
     {
-        LOCK(chainman().GetMutex());
-        BlockValidationState state{TestBlockValidity(chainman().ActiveChainstate(), block, /*check_pow=*/options.check_pow, /*check_merkle_root=*/options.check_merkle_root)};
-        reason = state.GetRejectReason();
-        debug = state.GetDebugMessage();
-        return state.IsValid();
+        return m_task_runner->schedule([this, block_in = std::move(block_in), fn = std::move(fn)](std::atomic_bool& cancelled) mutable {
+            if (cancelled.load(std::memory_order_acquire)) return;
+            auto block{std::make_shared<const CBlock>(std::move(block_in))};
+            bool new_block;
+            std::string reason;
+            std::string debug;
+            const bool accepted{SubmitBlock(chainman(), block, &new_block, reason, debug)};
+            // ProcessNewBlock() can accept and store a block before it is checked
+            // for validity. Treat duplicates as errors for mining clients, and only
+            // return success when validation completed without setting a reason.
+            if (!cancelled.load(std::memory_order_acquire)) fn(accepted && new_block && reason.empty(), std::move(reason), std::move(debug));
+        });
     }
 
-    bool submitBlock(const CBlock& block_in, std::string& reason, std::string& debug) override
-    {
-        auto block = std::make_shared<const CBlock>(block_in);
-        bool new_block;
-        const bool accepted = SubmitBlock(chainman(), block, &new_block, reason, debug);
-        // ProcessNewBlock() can accept and store a block before it is checked
-        // for validity. Treat duplicates as errors for mining clients, and only
-        // return success when validation completed without setting a reason.
-        return accepted && new_block && reason.empty();
-    }
-
-    const NodeContext* context() override { return &m_node; }
+    NodeContext* context() override { return &m_node; }
     ChainstateManager& chainman() { return *Assert(m_node.chainman); }
     KernelNotifications& notifications() { return *Assert(m_node.notifications); }
-    // Treat as if guarded by notifications().m_tip_block_mutex
-    bool m_interrupt_mining{false};
-    const NodeContext& m_node;
+    std::shared_ptr<MiningTaskRunner> m_task_runner;
+    NodeContext& m_node;
 };
 
 } // namespace
@@ -926,7 +1248,7 @@ public:
 namespace interfaces {
 std::unique_ptr<Node> MakeNode(node::NodeContext& context) { return std::make_unique<node::NodeImpl>(context); }
 std::unique_ptr<Chain> MakeChain(node::NodeContext& context) { return std::make_unique<node::ChainImpl>(context); }
-std::unique_ptr<Mining> MakeMining(const node::NodeContext& context, bool wait_loaded)
+std::unique_ptr<Mining> MakeMining(node::NodeContext& context, bool wait_loaded)
 {
     if (wait_loaded) {
         node::KernelNotifications& kernel_notifications(*Assert(context.notifications));

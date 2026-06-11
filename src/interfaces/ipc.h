@@ -8,7 +8,6 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <typeindex>
 
 namespace ipc {
 struct Context;
@@ -74,21 +73,8 @@ public:
     //! Disconnect any incoming connections that are still connected.
     virtual void disconnectIncoming() = 0;
 
-    //! Add cleanup callback to remote interface that will run when the
-    //! interface is deleted.
-    template<typename Interface>
-    void addCleanup(Interface& iface, std::function<void()> cleanup)
-    {
-        addCleanup(typeid(Interface), &iface, std::move(cleanup));
-    }
-
     //! IPC context struct accessor (see struct definition for more description).
     virtual ipc::Context& context() = 0;
-
-protected:
-    //! Internal implementation of public addCleanup method (above) as a
-    //! type-erased virtual function, since template functions can't be virtual.
-    virtual void addCleanup(std::type_index type, void* iface, std::function<void()> cleanup) = 0;
 };
 
 //! Return implementation of Ipc interface.

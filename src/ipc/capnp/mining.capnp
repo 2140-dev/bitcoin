@@ -8,61 +8,78 @@ using Cxx = import "/capnp/c++.capnp";
 $Cxx.namespace("ipc::capnp::messages");
 
 using Common = import "common.capnp";
-using Proxy = import "/mp/proxy.capnp";
-$Proxy.include("interfaces/mining.h");
-$Proxy.includeTypes("ipc/capnp/mining-types.h");
 
 const maxMoney :Int64 = 2100000000000000;
 const maxDouble :Float64 = 1.7976931348623157e308;
 const defaultBlockReservedWeight :UInt32 = 8000;
 const defaultCoinbaseOutputMaxAdditionalSigops :UInt32 = 400;
 
-interface Mining $Proxy.wrap("interfaces::Mining") {
-    isTestChain @0 (context :Proxy.Context) -> (result: Bool);
-    isInitialBlockDownload @1 (context :Proxy.Context) -> (result: Bool);
-    getTip @2 (context :Proxy.Context) -> (result: Common.BlockRef, hasResult: Bool);
-    waitTipChanged @3 (context :Proxy.Context, currentTip: Data, timeout: Float64 = .maxDouble) -> (result: Common.BlockRef);
-    createNewBlock @4 (context :Proxy.Context, options: BlockCreateOptions, cooldown: Bool = true) -> (result: BlockTemplate);
-    checkBlock @5 (context :Proxy.Context, block: Data, options: BlockCheckOptions) -> (reason: Text, debug: Text, result: Bool);
-    interrupt @6 () -> ();
-    submitBlock @7 (context :Proxy.Context, block: Data) -> (reason: Text, debug: Text, result: Bool);
+interface Mining {
+    isTestChain @0 () -> (result: Bool);
+    isInitialBlockDownload @1 () -> (result: Bool);
+    getTip @2 () -> (result: Common.BlockRef, found: Bool);
+    createNewBlock @3 (options: BlockCreateOptions, cooldown: Bool = true) -> (result: BlockTemplate, found: Bool);
+    checkBlock @4 (block: Data, options: BlockCheckOptions) -> (reason: Text, debug: Text, result: Bool);
+    watchTip @5 (currentTip: Data, timeout: Float64 = .maxDouble, listener: TipListener) -> (watch: Watch);
+    submitBlock @6 (block: Data) -> (reason: Text, debug: Text, result: Bool);
 }
 
-interface BlockTemplate $Proxy.wrap("interfaces::BlockTemplate") {
-    destroy @0 (context :Proxy.Context) -> ();
-    getBlockHeader @1 (context: Proxy.Context) -> (result: Data);
-    getBlock @2 (context: Proxy.Context) -> (result: Data);
-    getTxFees @3 (context: Proxy.Context) -> (result: List(Int64));
-    getTxSigops @4 (context: Proxy.Context) -> (result: List(Int64));
-    getCoinbaseTx @5 (context: Proxy.Context) -> (result: CoinbaseTx);
-    getCoinbaseMerklePath @6 (context: Proxy.Context) -> (result: List(Data));
-    submitSolution @7 (context: Proxy.Context, version: UInt32, timestamp: UInt32, nonce: UInt32, coinbase :Data) -> (result: Bool);
-    waitNext @8 (context: Proxy.Context, options: BlockWaitOptions) -> (result: BlockTemplate);
-    interruptWait @9() -> ();
+interface BlockTemplate {
+    getBlockHeader @0 () -> (result: Data);
+    getBlock @1 () -> (result: Data);
+    getTxFees @2 () -> (result: List(Int64));
+    getTxSigops @3 () -> (result: List(Int64));
+    getCoinbaseTx @4 () -> (result: CoinbaseTx);
+    getCoinbaseMerklePath @5 () -> (result: List(Data));
+    submitSolution @6 (version: UInt32, timestamp: UInt32, nonce: UInt32, coinbase: Data) -> (result: Bool);
+    watchNext @7 (options: BlockWaitOptions, listener: BlockTemplateListener) -> (watch: Watch);
 }
 
-struct BlockCreateOptions $Proxy.wrap("node::BlockCreateOptions") {
-    useMempool @0 :Bool = true $Proxy.name("use_mempool");
-    blockReservedWeight @1 :UInt64 = .defaultBlockReservedWeight $Proxy.name("block_reserved_weight");
-    coinbaseOutputMaxAdditionalSigops @2 :UInt64 = .defaultCoinbaseOutputMaxAdditionalSigops $Proxy.name("coinbase_output_max_additional_sigops");
+interface TipListener {
+    tipChanged @0 (tip: Common.BlockRef) -> ();
+    stopped @1 () -> ();
 }
 
-struct BlockWaitOptions $Proxy.wrap("node::BlockWaitOptions") {
-    timeout @0 : Float64 = .maxDouble $Proxy.name("timeout");
-    feeThreshold @1 : Int64 = .maxMoney $Proxy.name("fee_threshold");
+interface BlockTemplateListener {
+    templateReady @0 (result: BlockTemplate) -> ();
+    stopped @1 () -> ();
 }
 
-struct BlockCheckOptions $Proxy.wrap("node::BlockCheckOptions") {
-    checkMerkleRoot @0 :Bool = true $Proxy.name("check_merkle_root");
-    checkPow @1 :Bool = true $Proxy.name("check_pow");
+interface Watch {
+    cancel @0 () -> ();
 }
 
-struct CoinbaseTx $Proxy.wrap("node::CoinbaseTx") {
-    version @0 :UInt32 $Proxy.name("version");
-    sequence @1 :UInt32 $Proxy.name("sequence");
-    scriptSigPrefix @2 :Data $Proxy.name("script_sig_prefix");
-    witness @3 :Data $Proxy.name("witness");
-    blockRewardRemaining @4 :Int64 $Proxy.name("block_reward_remaining");
-    requiredOutputs @5 :List(Data) $Proxy.name("required_outputs");
-    lockTime @6 :UInt32 $Proxy.name("lock_time");
+struct BlockCreateOptions {
+    useMempool @0 :Bool = true;
+    hasBlockMinFeeRate @1 :Bool = false;
+    blockMinFeeRate @2 :Data;
+    hasPrintModifiedFee @3 :Bool = false;
+    printModifiedFee @4 :Bool = false;
+    hasBlockReservedWeight @5 :Bool = false;
+    blockReservedWeight @6 :UInt64 = .defaultBlockReservedWeight;
+    hasBlockMaxWeight @7 :Bool = false;
+    blockMaxWeight @8 :UInt64 = 0;
+    coinbaseOutputMaxAdditionalSigops @9 :UInt64 = .defaultCoinbaseOutputMaxAdditionalSigops;
+    coinbaseOutputScript @10 :Data;
+    testBlockValidity @11 :Bool = true;
+}
+
+struct BlockWaitOptions {
+    timeout @0 : Float64 = .maxDouble;
+    feeThreshold @1 : Int64 = .maxMoney;
+}
+
+struct BlockCheckOptions {
+    checkMerkleRoot @0 :Bool = true;
+    checkPow @1 :Bool = true;
+}
+
+struct CoinbaseTx {
+    version @0 :UInt32;
+    sequence @1 :UInt32;
+    scriptSigPrefix @2 :Data;
+    witness @3 :Data;
+    blockRewardRemaining @4 :Int64;
+    requiredOutputs @5 :List(Data);
+    lockTime @6 :UInt32;
 }

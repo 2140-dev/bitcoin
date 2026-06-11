@@ -2,33 +2,151 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <ipc/test/ipc_test.h>
+
+#include <capnp/rpc-twoparty.h>
+#include <capnp/rpc.h>
 #include <interfaces/init.h>
+#include <interfaces/mining.h>
+#include <ipc/capnp/common-types.h>
+#include <ipc/capnp/init.capnp.h>
+#include <ipc/capnp/mining.capnp.h>
 #include <ipc/capnp/protocol.h>
 #include <ipc/process.h>
 #include <ipc/protocol.h>
-#include <logging.h>
-#include <mp/proxy-types.h>
-#include <ipc/capnp/mining.capnp.h>
-#include <ipc/test/ipc_test.capnp.h>
-#include <ipc/test/ipc_test.capnp.proxy.h>
-#include <ipc/test/ipc_test.h>
+#include <kj/async-io.h>
+#include <kj/debug.h>
 #include <tinyformat.h>
-#include <chainstate.h>
-
-#include <atomic>
-#include <future>
-#include <thread>
-#include <kj/common.h>
-#include <kj/memory.h>
-#include <kj/test.h>
-#include <stdexcept>
 
 #include <boost/test/unit_test.hpp>
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <future>
+#include <mutex>
+#include <span>
+#include <stdexcept>
+#include <thread>
 
 static_assert(ipc::capnp::messages::MAX_MONEY == MAX_MONEY);
 static_assert(ipc::capnp::messages::MAX_DOUBLE == std::numeric_limits<double>::max());
 static_assert(ipc::capnp::messages::DEFAULT_BLOCK_RESERVED_WEIGHT == DEFAULT_BLOCK_RESERVED_WEIGHT);
 static_assert(ipc::capnp::messages::DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS == DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS);
+
+namespace {
+
+namespace messages = ipc::capnp::messages;
+
+::capnp::rpc::twoparty::VatId::Reader ServerVatId(::capnp::MallocMessageBuilder& message)
+{
+    auto vat_id{message.getRoot<::capnp::rpc::twoparty::VatId>()};
+    vat_id.setSide(::capnp::rpc::twoparty::Side::SERVER);
+    return vat_id.asReader();
+}
+
+void SetData(::capnp::Data::Builder output, std::span<const unsigned char> bytes)
+{
+    std::copy(bytes.begin(), bytes.end(), output.begin());
+}
+
+uint256 ReadUint256(::capnp::Data::Reader data)
+{
+    BOOST_REQUIRE_EQUAL(data.size(), uint256::size());
+    uint256 value;
+    std::copy(data.begin(), data.end(), value.begin());
+    return value;
+}
+
+interfaces::BlockRef ReadBlockRef(messages::BlockRef::Reader reader)
+{
+    return {.hash = ReadUint256(reader.getHash()), .height = reader.getHeight()};
+}
+
+struct TestMiningState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    int cancellations{0};
+};
+
+class TestBlockTemplate final : public interfaces::BlockTemplate
+{
+public:
+    CBlockHeader getBlockHeader() override { return {}; }
+    CBlock getBlock() override { return {}; }
+    std::vector<CAmount> getTxFees() override { return {12, 34}; }
+    std::vector<int64_t> getTxSigops() override { return {1, 2}; }
+    node::CoinbaseTx getCoinbaseTx() override
+    {
+        return {
+            .version = 1,
+            .sequence = CTxIn::SEQUENCE_FINAL,
+            .script_sig_prefix = {},
+            .witness = std::nullopt,
+            .block_reward_remaining = 0,
+            .required_outputs = {},
+            .lock_time = 0,
+        };
+    }
+    std::vector<uint256> getCoinbaseMerklePath() override { return {}; }
+    std::unique_ptr<interfaces::Handler> submitSolutionAsync(uint32_t, uint32_t, uint32_t, CTransactionRef, SubmitSolutionFn fn) override
+    {
+        fn(true);
+        return interfaces::MakeCleanupHandler([] {});
+    }
+    std::unique_ptr<interfaces::Handler> watchNext(node::BlockWaitOptions, NextTemplateFn fn) override
+    {
+        fn(std::make_unique<TestBlockTemplate>());
+        return interfaces::MakeCleanupHandler([] {});
+    }
+};
+
+class TestMining final : public interfaces::Mining
+{
+public:
+    explicit TestMining(std::shared_ptr<TestMiningState> state) : m_state(std::move(state)) {}
+
+    bool isTestChain() override { return true; }
+    bool isInitialBlockDownload() override { return false; }
+
+    std::optional<interfaces::BlockRef> getTip() override
+    {
+        return interfaces::BlockRef{.hash = uint256::ONE, .height = 7};
+    }
+
+    std::unique_ptr<interfaces::Handler> watchTip(uint256 current_tip, MillisecondsDouble, TipChangedFn fn) override
+    {
+        if (current_tip != uint256::ONE) fn(getTip());
+        return interfaces::MakeCleanupHandler([state = m_state] {
+            {
+                std::lock_guard lock{state->mutex};
+                ++state->cancellations;
+            }
+            state->cv.notify_all();
+        });
+    }
+
+    std::unique_ptr<interfaces::Handler> createNewBlockAsync(const node::BlockCreateOptions&, bool, CreateBlockFn fn) override
+    {
+        fn(CreateBlockResult{std::make_unique<TestBlockTemplate>()});
+        return interfaces::MakeCleanupHandler([] {});
+    }
+
+    std::unique_ptr<interfaces::Handler> checkBlockAsync(CBlock, node::BlockCheckOptions, CheckBlockFn fn) override
+    {
+        fn(true, "accepted", "checked");
+        return interfaces::MakeCleanupHandler([] {});
+    }
+
+    std::unique_ptr<interfaces::Handler> submitBlockAsync(CBlock, SubmitBlockFn fn) override
+    {
+        fn(true, "submitted", "processed");
+        return interfaces::MakeCleanupHandler([] {});
+    }
+
+private:
+    std::shared_ptr<TestMiningState> m_state;
+};
 
 //! Remote init class.
 namespace {
@@ -36,9 +154,73 @@ class TestInit : public interfaces::Init
 {
 public:
     std::atomic<bool> stop_called{false};
+    std::shared_ptr<TestMiningState> mining_state{std::make_shared<TestMiningState>()};
     std::unique_ptr<interfaces::Echo> makeEcho() override { return interfaces::MakeEcho(); }
+    std::unique_ptr<interfaces::Mining> makeMining() override { return std::make_unique<TestMining>(mining_state); }
     void stop() override { stop_called.store(true); }
 };
+} // namespace
+
+class TestTipListener final : public messages::TipListener::Server
+{
+public:
+    explicit TestTipListener(kj::Own<kj::PromiseFulfiller<interfaces::BlockRef>> fulfiller)
+    {
+        m_fulfiller.emplace(kj::mv(fulfiller));
+    }
+
+    kj::Promise<void> tipChanged(TipChangedContext context) override
+    {
+        if (m_fulfiller) {
+            (*m_fulfiller)->fulfill(ReadBlockRef(context.getParams().getTip()));
+            m_fulfiller.reset();
+        }
+        return kj::READY_NOW;
+    }
+
+    kj::Promise<void> stopped(StoppedContext) override
+    {
+        if (m_fulfiller) {
+            (*m_fulfiller)->reject(KJ_EXCEPTION(FAILED, "tip watch stopped"));
+            m_fulfiller.reset();
+        }
+        return kj::READY_NOW;
+    }
+
+private:
+    std::optional<kj::Own<kj::PromiseFulfiller<interfaces::BlockRef>>> m_fulfiller;
+};
+
+class TestTemplateListener final : public messages::BlockTemplateListener::Server
+{
+public:
+    explicit TestTemplateListener(kj::Own<kj::PromiseFulfiller<messages::BlockTemplate::Client>> fulfiller)
+    {
+        m_fulfiller.emplace(kj::mv(fulfiller));
+    }
+
+    kj::Promise<void> templateReady(TemplateReadyContext context) override
+    {
+        if (m_fulfiller) {
+            (*m_fulfiller)->fulfill(context.getParams().getResult());
+            m_fulfiller.reset();
+        }
+        return kj::READY_NOW;
+    }
+
+    kj::Promise<void> stopped(StoppedContext) override
+    {
+        if (m_fulfiller) {
+            (*m_fulfiller)->reject(KJ_EXCEPTION(FAILED, "template watch stopped"));
+            m_fulfiller.reset();
+        }
+        return kj::READY_NOW;
+    }
+
+private:
+    std::optional<kj::Own<kj::PromiseFulfiller<messages::BlockTemplate::Client>>> m_fulfiller;
+};
+
 } // namespace
 
 //! Generate a temporary path with temp_directory_path and mkstemp
@@ -52,73 +234,6 @@ static std::string TempPath(std::string_view pattern)
     temp.resize(temp.size() - 1);
     fs::remove(fs::PathFromString(temp));
     return temp;
-}
-
-//! Unit test that tests execution of IPC calls without actually creating a
-//! separate process. This test is primarily intended to verify behavior of type
-//! conversion code that converts C++ objects to Cap'n Proto messages and vice
-//! versa.
-//!
-//! The test creates a thread which creates a FooImplementation object (defined
-//! in ipc_test.h) and a two-way pipe accepting IPC requests which call methods
-//! on the object through FooInterface (defined in ipc_test.capnp).
-void IpcPipeTest()
-{
-    // Setup: create FooImplementation object and listen for FooInterface requests
-    std::promise<std::unique_ptr<mp::ProxyClient<gen::FooInterface>>> foo_promise;
-    std::thread thread([&]() {
-        mp::EventLoop loop("IpcPipeTest", [](bool raise, const std::string& log) { LogInfo("LOG%i: %s", raise, log); });
-        auto pipe = loop.m_io_context.provider->newTwoWayPipe();
-
-        auto connection_client = std::make_unique<mp::Connection>(loop, kj::mv(pipe.ends[0]));
-        auto foo_client = std::make_unique<mp::ProxyClient<gen::FooInterface>>(
-            connection_client->m_rpc_system->bootstrap(mp::ServerVatId().vat_id).castAs<gen::FooInterface>(),
-            connection_client.get(), /* destroy_connection= */ true);
-        (void)connection_client.release();
-        foo_promise.set_value(std::move(foo_client));
-
-        auto connection_server = std::make_unique<mp::Connection>(loop, kj::mv(pipe.ends[1]), [&](mp::Connection& connection) {
-            auto foo_server = kj::heap<mp::ProxyServer<gen::FooInterface>>(std::make_shared<FooImplementation>(), connection);
-            return capnp::Capability::Client(kj::mv(foo_server));
-        });
-        connection_server->onDisconnect([&] { connection_server.reset(); });
-        loop.loop();
-    });
-    std::unique_ptr<mp::ProxyClient<gen::FooInterface>> foo{foo_promise.get_future().get()};
-
-    // Test: make sure arguments were sent and return value is received
-    BOOST_CHECK_EQUAL(foo->add(1, 2), 3);
-
-    COutPoint txout1{Txid::FromUint256(uint256{100}), 200};
-    COutPoint txout2{foo->passOutPoint(txout1)};
-    BOOST_CHECK(txout1 == txout2);
-
-    UniValue uni1{UniValue::VOBJ};
-    uni1.pushKV("i", 1);
-    uni1.pushKV("s", "two");
-    UniValue uni2{foo->passUniValue(uni1)};
-    BOOST_CHECK_EQUAL(uni1.write(), uni2.write());
-
-    CMutableTransaction mtx;
-    mtx.version = 2;
-    mtx.nLockTime = 3;
-    mtx.vin.emplace_back(txout1);
-    mtx.vout.emplace_back(COIN, CScript());
-    CTransactionRef tx1{MakeTransactionRef(mtx)};
-    CTransactionRef tx2{foo->passTransaction(tx1)};
-    BOOST_CHECK(*Assert(tx1) == *Assert(tx2));
-
-    std::vector<char> vec1{'H', 'e', 'l', 'l', 'o'};
-    std::vector<char> vec2{foo->passVectorChar(vec1)};
-    BOOST_CHECK_EQUAL(std::string_view(vec1.begin(), vec1.end()), std::string_view(vec2.begin(), vec2.end()));
-
-    auto script1{CScript() << OP_11};
-    auto script2{foo->passScript(script1)};
-    BOOST_CHECK_EQUAL(HexStr(script1), HexStr(script2));
-
-    // Test cleanup: disconnect and join thread
-    foo.reset();
-    thread.join();
 }
 
 //! Test ipc::Protocol connect() and serve() methods connecting over a socketpair.
@@ -137,9 +252,199 @@ void IpcSocketPairTest()
     std::unique_ptr<interfaces::Echo> remote_echo{remote_init->makeEcho()};
     BOOST_CHECK_EQUAL(remote_echo->echo("echo test"), "echo test");
     remote_echo.reset();
+    std::unique_ptr<interfaces::Mining> remote_mining{remote_init->makeMining()};
+    BOOST_REQUIRE(remote_mining);
+    BOOST_CHECK(remote_mining->isTestChain());
+    BOOST_CHECK(!remote_mining->isInitialBlockDownload());
+    const auto tip{remote_mining->getTip()};
+    BOOST_REQUIRE(tip);
+    BOOST_CHECK_EQUAL(tip->hash.ToString(), uint256::ONE.ToString());
+    BOOST_CHECK_EQUAL(tip->height, 7);
+    const auto test_thread{std::this_thread::get_id()};
+
+    struct TipResult {
+        std::thread::id callback_thread;
+        std::optional<interfaces::BlockRef> tip;
+    };
+    std::promise<TipResult> async_tip_promise;
+    auto tip_handler{remote_mining->watchTip(uint256::ZERO, MillisecondsDouble{0}, [&async_tip_promise](std::optional<interfaces::BlockRef> tip) {
+        async_tip_promise.set_value({std::this_thread::get_id(), std::move(tip)});
+    })};
+    (void)tip_handler;
+    const auto tip_result{async_tip_promise.get_future().get()};
+    BOOST_CHECK(tip_result.callback_thread != test_thread);
+    const auto& changed_tip{tip_result.tip};
+    BOOST_REQUIRE(changed_tip);
+    BOOST_CHECK_EQUAL(changed_tip->height, 7);
+
+    struct CreateResult {
+        std::thread::id callback_thread;
+        std::unique_ptr<interfaces::BlockTemplate> block_template;
+    };
+    std::promise<CreateResult> create_promise;
+    auto create_handler{remote_mining->createNewBlockAsync(node::BlockCreateOptions{}, false, [&create_promise](interfaces::Mining::CreateBlockResult result) {
+        std::unique_ptr<interfaces::BlockTemplate> block_template;
+        if (result) block_template = std::move(*result);
+        create_promise.set_value({std::this_thread::get_id(), std::move(block_template)});
+    })};
+    (void)create_handler;
+    auto create_result{create_promise.get_future().get()};
+    BOOST_CHECK(create_result.callback_thread != test_thread);
+    BOOST_REQUIRE(create_result.block_template);
+    const auto fees{create_result.block_template->getTxFees()};
+    BOOST_REQUIRE_EQUAL(fees.size(), 2);
+    BOOST_CHECK_EQUAL(fees[0], 12);
+    BOOST_CHECK_EQUAL(fees[1], 34);
+
+    struct NextResult {
+        std::thread::id callback_thread;
+        std::unique_ptr<interfaces::BlockTemplate> block_template;
+    };
+    std::promise<NextResult> next_promise;
+    auto next_handler{create_result.block_template->watchNext(node::BlockWaitOptions{}, [&next_promise](std::unique_ptr<interfaces::BlockTemplate> block_template) {
+        next_promise.set_value({std::this_thread::get_id(), std::move(block_template)});
+    })};
+    (void)next_handler;
+    auto next_result{next_promise.get_future().get()};
+    BOOST_CHECK(next_result.callback_thread != test_thread);
+    BOOST_REQUIRE(next_result.block_template);
+
+    struct SubmitResult {
+        std::thread::id callback_thread;
+        bool accepted{false};
+    };
+    std::promise<SubmitResult> submit_promise;
+    auto submit_handler{next_result.block_template->submitSolutionAsync(0, 0, 0, MakeTransactionRef(CMutableTransaction{}), [&submit_promise](bool accepted) {
+        submit_promise.set_value({std::this_thread::get_id(), accepted});
+    })};
+    (void)submit_handler;
+    const auto submit_result{submit_promise.get_future().get()};
+    BOOST_CHECK(submit_result.callback_thread != test_thread);
+    BOOST_CHECK(submit_result.accepted);
+
+    struct CheckResult {
+        std::thread::id callback_thread;
+        bool valid{false};
+        std::string reason;
+        std::string debug;
+    };
+    std::promise<CheckResult> check_promise;
+    auto check_handler{remote_mining->checkBlockAsync(CBlock{}, node::BlockCheckOptions{}, [&check_promise](bool valid, std::string reason, std::string debug) {
+        check_promise.set_value({std::this_thread::get_id(), valid, std::move(reason), std::move(debug)});
+    })};
+    (void)check_handler;
+    const auto check_result{check_promise.get_future().get()};
+    BOOST_CHECK(check_result.callback_thread != test_thread);
+    BOOST_CHECK(check_result.valid);
+    BOOST_CHECK_EQUAL(check_result.reason, "accepted");
+    BOOST_CHECK_EQUAL(check_result.debug, "checked");
+
+    struct SubmitBlockResult {
+        std::thread::id callback_thread;
+        bool accepted{false};
+        std::string reason;
+        std::string debug;
+    };
+    std::promise<SubmitBlockResult> submit_block_promise;
+    auto submit_block_handler{remote_mining->submitBlockAsync(CBlock{}, [&submit_block_promise](bool accepted, std::string reason, std::string debug) {
+        submit_block_promise.set_value({std::this_thread::get_id(), accepted, std::move(reason), std::move(debug)});
+    })};
+    (void)submit_block_handler;
+    const auto submit_block_result{submit_block_promise.get_future().get()};
+    BOOST_CHECK(submit_block_result.callback_thread != test_thread);
+    BOOST_CHECK(submit_block_result.accepted);
+    BOOST_CHECK_EQUAL(submit_block_result.reason, "submitted");
+    BOOST_CHECK_EQUAL(submit_block_result.debug, "processed");
+
+    remote_mining.reset();
     remote_init->stop();
     BOOST_CHECK(static_cast<TestInit*>(init.get())->stop_called.load());
+    submit_block_handler.reset();
+    check_handler.reset();
+    submit_handler.reset();
+    next_handler.reset();
+    create_handler.reset();
+    tip_handler.reset();
+    next_result.block_template.reset();
+    create_result.block_template.reset();
     remote_init.reset();
+    thread.join();
+}
+
+//! Test the native Cap'n Proto mining watch/cancel API without going through
+//! the synchronous C++ compatibility wrapper.
+void IpcNativeMiningWatchTest()
+{
+    int fds[2];
+    BOOST_CHECK_EQUAL(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    auto init{std::make_unique<TestInit>()};
+    auto* test_init{init.get()};
+    std::unique_ptr<ipc::Protocol> protocol{ipc::capnp::MakeCapnpProtocol()};
+    std::promise<void> promise;
+    std::thread thread([&] {
+        protocol->serve(fds[0], "test-serve", *init, [&] { promise.set_value(); });
+    });
+    promise.get_future().wait();
+
+    {
+        auto io{kj::setupAsyncIo()};
+        auto stream{io.lowLevelProvider->wrapSocketFd(fds[1], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP)};
+        ::capnp::TwoPartyVatNetwork network{*stream, ::capnp::rpc::twoparty::Side::CLIENT, ::capnp::ReaderOptions{}};
+        auto rpc_system{::capnp::makeRpcClient(network)};
+        ::capnp::MallocMessageBuilder vat_message;
+        auto init_client{rpc_system.bootstrap(ServerVatId(vat_message)).castAs<messages::Init>()};
+        auto mining{init_client.makeMiningRequest().send().wait(io.waitScope).getResult()};
+
+        auto tip_pair{kj::newPromiseAndFulfiller<interfaces::BlockRef>()};
+        auto watch_tip{mining.watchTipRequest()};
+        SetData(watch_tip.initCurrentTip(uint256::size()), {uint256::ZERO.data(), uint256::ZERO.size()});
+        watch_tip.setListener(messages::TipListener::Client(kj::heap<TestTipListener>(kj::mv(tip_pair.fulfiller))));
+        auto watch_response{watch_tip.send().wait(io.waitScope)};
+        const auto tip{tip_pair.promise.wait(io.waitScope)};
+        BOOST_CHECK_EQUAL(tip.hash.ToString(), uint256::ONE.ToString());
+        BOOST_CHECK_EQUAL(tip.height, 7);
+
+        auto cancel_watch{mining.watchTipRequest()};
+        SetData(cancel_watch.initCurrentTip(uint256::size()), {uint256::ONE.data(), uint256::ONE.size()});
+        auto cancel_pair{kj::newPromiseAndFulfiller<interfaces::BlockRef>()};
+        cancel_watch.setListener(messages::TipListener::Client(kj::heap<TestTipListener>(kj::mv(cancel_pair.fulfiller))));
+        auto cancel_response{cancel_watch.send().wait(io.waitScope)};
+        cancel_response.getWatch().cancelRequest().send().wait(io.waitScope);
+        {
+            std::unique_lock lock{test_init->mining_state->mutex};
+            BOOST_CHECK(test_init->mining_state->cv.wait_for(lock, std::chrono::seconds{5}, [&] {
+                return test_init->mining_state->cancellations > 0;
+            }));
+        }
+
+        watch_response.getWatch().cancelRequest().send().wait(io.waitScope);
+
+        auto create_template{mining.createNewBlockRequest()};
+        create_template.setCooldown(false);
+        auto template_response{create_template.send().wait(io.waitScope)};
+        BOOST_REQUIRE(template_response.getFound());
+        auto template_pair{kj::newPromiseAndFulfiller<messages::BlockTemplate::Client>()};
+        auto watch_template{template_response.getResult().watchNextRequest()};
+        watch_template.setListener(messages::BlockTemplateListener::Client(kj::heap<TestTemplateListener>(kj::mv(template_pair.fulfiller))));
+        auto template_watch_response{watch_template.send().wait(io.waitScope)};
+        auto next_template{template_pair.promise.wait(io.waitScope)};
+        auto fees_response{next_template.getTxFeesRequest().send().wait(io.waitScope)};
+        auto fees{fees_response.getResult()};
+        BOOST_REQUIRE_EQUAL(fees.size(), 2);
+        BOOST_CHECK_EQUAL(fees[0], 12);
+        BOOST_CHECK_EQUAL(fees[1], 34);
+        template_watch_response.getWatch().cancelRequest().send().wait(io.waitScope);
+
+        auto submit_block{mining.submitBlockRequest()};
+        const auto block_bytes{ipc::capnp::SerializeBytes(CBlock{})};
+        SetData(submit_block.initBlock(block_bytes.size()), block_bytes);
+        auto submit_response{submit_block.send().wait(io.waitScope)};
+        BOOST_CHECK(submit_response.getResult());
+        BOOST_CHECK_EQUAL(submit_response.getReason().cStr(), "submitted");
+        BOOST_CHECK_EQUAL(submit_response.getDebug().cStr(), "processed");
+
+        init_client.stopRequest().send().wait(io.waitScope);
+    }
     thread.join();
 }
 

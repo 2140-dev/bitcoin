@@ -49,7 +49,7 @@ using node::NodeContext;
 
 namespace {
 
-const TestingSetup* g_setup;
+TestingSetup* g_setup;
 std::vector<COutPoint> g_outpoints_coinbase_init_mature;
 
 struct MockedTxPool : public CTxMemPool {
@@ -63,7 +63,7 @@ struct MockedTxPool : public CTxMemPool {
 
 void initialize_tx_pool()
 {
-    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>();
+    static const auto testing_setup = MakeNoLogFileContext<TestingSetup>();
     g_setup = testing_setup.get();
     SetMockTime(WITH_LOCK(g_setup->m_node.chainman->GetMutex(), return g_setup->m_node.chainman->ActiveTip()->Time()));
 
