@@ -19,6 +19,7 @@
 #include <script/script.h>
 #include <sync.h>
 #include <test/util/common.h> // IWYU pragma: keep
+#include <test/util/mining.h>
 #include <test/util/script.h>
 #include <test/util/setup_common.h>
 #include <util/time.h>
@@ -78,7 +79,7 @@ std::shared_ptr<CBlock> MinerTestingSetup::Block(const uint256& prev_hash)
     static uint64_t time = Params().GenesisBlock().nTime;
 
     auto mining{interfaces::MakeMining(m_node)};
-    auto block_template{mining->createNewBlock({
+    auto block_template{CreateNewBlock(*mining, {
         .coinbase_output_script = CScript{} << i++ << OP_TRUE,
     }, /*cooldown=*/false)};
     BOOST_REQUIRE(block_template);
@@ -344,11 +345,10 @@ BOOST_AUTO_TEST_CASE(mempool_locks_reorg)
 
 BOOST_AUTO_TEST_CASE(witness_commitment_index)
 {
-    LOCK(Assert(m_node.chainman)->GetMutex());
     CScript pubKey;
     pubKey << 1 << OP_TRUE;
     auto mining{interfaces::MakeMining(m_node)};
-    auto block_template{mining->createNewBlock({
+    auto block_template{CreateNewBlock(*mining, {
         .coinbase_output_script = pubKey,
     }, /*cooldown=*/false)};
     BOOST_REQUIRE(block_template);

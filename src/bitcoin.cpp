@@ -8,14 +8,14 @@
 #include <common/args.h>
 #include <common/license_info.h>
 #include <common/system.h>
-#include <util/fs.h>
+#include <tinyformat.h>
 #include <util/exec.h>
+#include <util/fs.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
 
 #include <iostream>
 #include <string>
-#include <tinyformat.h>
 #include <vector>
 
 const TranslateFn G_TRANSLATION_FUN{nullptr};
@@ -23,7 +23,7 @@ const TranslateFn G_TRANSLATION_FUN{nullptr};
 static constexpr auto HELP_USAGE = R"(Usage: %s [OPTIONS] COMMAND...
 
 Options:
-  -m, --multiprocess     Run multiprocess binary bitcoin-node.
+  -m, --ipc-server       Run IPC server binary bitcoin-node.
   -M, --monolithic       Run monolithic binary bitcoind. (Default behavior)
   -v, --version          Show version information
   -h, --help             Show full help message
@@ -47,7 +47,7 @@ Run '%s help' to see additional commands (e.g. for testing and debugging).
 )";
 
 struct CommandLine {
-    std::optional<bool> use_multiprocess;
+    std::optional<bool> use_ipc_server;
     bool show_version{false};
     bool show_help{false};
     std::string_view command;
@@ -118,10 +118,10 @@ CommandLine ParseCommandLine(int argc, char* argv[])
         std::string_view arg = argv[i];
         if (!cmd.command.empty()) {
             cmd.args.emplace_back(argv[i]);
-        } else if (arg == "-m" || arg == "--multiprocess") {
-            cmd.use_multiprocess = true;
+        } else if (arg == "-m" || arg == "--ipc-server") {
+            cmd.use_ipc_server = true;
         } else if (arg == "-M" || arg == "--monolithic") {
-            cmd.use_multiprocess = false;
+            cmd.use_ipc_server = false;
         } else if (arg == "-v" || arg == "--version") {
             cmd.show_version = true;
         } else if (arg == "-h" || arg == "--help" || arg == "help") {
@@ -139,7 +139,7 @@ bool UseMultiprocess(const CommandLine& cmd)
 {
     // If -m or -M options were explicitly specified, there is no need to
     // further parse arguments to determine which to use.
-    if (cmd.use_multiprocess) return *cmd.use_multiprocess;
+    if (cmd.use_ipc_server) return *cmd.use_ipc_server;
 
     ArgsManager args;
     args.SetDefaultFlags(ArgsManager::ALLOW_ANY);
@@ -154,8 +154,8 @@ bool UseMultiprocess(const CommandLine& cmd)
     }
     args.SelectConfigNetwork(args.GetChainTypeString());
 
-    // If any -ipc* options are set these need to be processed by a
-    // multiprocess-capable binary.
+    // If any -ipc* options are set these need to be processed by the
+    // IPC-capable server binary.
     return args.IsArgSet("-ipcbind") || args.IsArgSet("-ipcconnect") || args.IsArgSet("-ipcfd");
 }
 
@@ -187,7 +187,7 @@ static void ExecCommand(const std::vector<const char*>& args, std::string_view w
     auto try_exec = [&](fs::path exe_path, bool allow_notfound = true) {
         std::string exe_path_str{fs::PathToString(exe_path)};
         exec_args[0] = exe_path_str.c_str();
-        if (util::ExecVp(exec_args[0], (char*const*)exec_args.data()) == -1) {
+        if (util::ExecVp(exec_args[0], (char* const*)exec_args.data()) == -1) {
             if (allow_notfound && errno == ENOENT) return false;
             throw std::system_error(errno, std::system_category(), strprintf("execvp failed to execute '%s'", exec_args[0]));
         }
@@ -217,11 +217,11 @@ static void ExecCommand(const std::vector<const char*>& args, std::string_view w
     // in libexec/
     (wrapper_dir.filename() == "bin" && try_exec(wrapper_dir.parent_path() / "libexec" / arg0.filename())) ||
 #ifdef WIN32
-    // Otherwise check the "daemon" subdirectory in a windows install.
-    (!wrapper_dir.empty() && try_exec(wrapper_dir / "daemon" / arg0.filename())) ||
+        // Otherwise check the "daemon" subdirectory in a windows install.
+        (!wrapper_dir.empty() && try_exec(wrapper_dir / "daemon" / arg0.filename())) ||
 #endif
-    // Otherwise look for target executable next to current wrapper
-    (!wrapper_dir.empty() && try_exec(wrapper_dir / arg0.filename(), fallback_os_search)) ||
-    // Otherwise just look on the system path.
-    (fallback_os_search && try_exec(arg0.filename(), false));
+        // Otherwise look for target executable next to current wrapper
+        (!wrapper_dir.empty() && try_exec(wrapper_dir / arg0.filename(), fallback_os_search)) ||
+        // Otherwise just look on the system path.
+        (fallback_os_search && try_exec(arg0.filename(), false));
 }

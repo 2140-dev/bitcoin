@@ -54,6 +54,7 @@
 #include <streams.h>
 #include <sync.h>
 #include <test/util/coverage.h>
+#include <test/util/mining.h>
 #include <test/util/net.h>
 #include <test/util/random.h>
 #include <test/util/txmempool.h>
@@ -438,7 +439,7 @@ CBlock TestChain100Setup::CreateBlock(
     const CScript& scriptPubKey)
 {
     auto mining{interfaces::MakeMining(m_node)};
-    auto block_template{mining->createNewBlock({
+    auto block_template{CreateNewBlock(*mining, {
         .use_mempool = false,
         .coinbase_output_script = scriptPubKey,
     }, /*cooldown=*/false)};

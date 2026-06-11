@@ -6,7 +6,9 @@
 # SOURCES property is processed to gather test suite macros.
 target_sources(test_bitcoin
   PRIVATE
+    ipc_test.cpp
     ipc_tests.cpp
 )
 
-target_link_libraries(test_bitcoin bitcoin_ipc_test bitcoin_ipc)
+target_link_libraries(test_bitcoin bitcoin_ipc CapnProto::capnp-rpc)
+target_include_directories(test_bitcoin SYSTEM PRIVATE ${CAPNP_INCLUDE_DIRS})

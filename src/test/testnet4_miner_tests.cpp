@@ -7,6 +7,7 @@
 #include <node/mining_types.h>
 #include <primitives/block.h>
 #include <sync.h>
+#include <test/util/mining.h>
 #include <test/util/setup_common.h>
 #include <test/util/time.h>
 #include <util/time.h>
@@ -43,7 +44,7 @@ BOOST_AUTO_TEST_CASE(MiningInterface)
     const auto template_time{3min + WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip()->Time())};
     NodeClockContext clock_ctx{template_time};
 
-    block_template = mining->createNewBlock({}, /*cooldown=*/false);
+    block_template = CreateNewBlock(*mining, {}, /*cooldown=*/false);
     BOOST_REQUIRE(block_template);
 
     // The template should use the mocked system time
@@ -53,19 +54,19 @@ BOOST_AUTO_TEST_CASE(MiningInterface)
     const BlockWaitOptions wait_options{.timeout = MillisecondsDouble{0}, .fee_threshold = 1};
 
     // waitNext() should return nullptr because there is no better template
-    auto should_be_nullptr = block_template->waitNext(wait_options);
+    auto should_be_nullptr = WaitNext(*block_template, wait_options);
     BOOST_REQUIRE(should_be_nullptr == nullptr);
 
     // This remains the case when exactly 20 minutes have gone by
     clock_ctx += 17min;
-    should_be_nullptr = block_template->waitNext(wait_options);
+    should_be_nullptr = WaitNext(*block_template, wait_options);
     BOOST_REQUIRE(should_be_nullptr == nullptr);
 
     // One second later the difficulty drops and it returns a new template
     // Note that we can't test the actual difficulty change, because the
     // difficulty is already at 1.
     clock_ctx += 1s;
-    block_template = block_template->waitNext(wait_options);
+    block_template = WaitNext(*block_template, wait_options);
     BOOST_REQUIRE(block_template);
 }
 

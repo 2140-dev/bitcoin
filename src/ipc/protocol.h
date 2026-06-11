@@ -9,7 +9,6 @@
 
 #include <functional>
 #include <memory>
-#include <typeindex>
 
 namespace ipc {
 struct Context;
@@ -60,10 +59,6 @@ public:
 
     //! Disconnect any incoming connections that are still connected.
     virtual void disconnectIncoming() = 0;
-
-    //! Add cleanup callback to interface that will run when the interface is
-    //! deleted.
-    virtual void addCleanup(std::type_index type, void* iface, std::function<void()> cleanup) = 0;
 
     //! Context accessor.
     virtual Context& context() = 0;

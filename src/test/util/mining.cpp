@@ -19,18 +19,93 @@
 #include <test/util/script.h>
 #include <uint256.h>
 #include <util/check.h>
+#include <util/result.h>
 #include <chainstate.h>
 #include <validationinterface.h>
 #include <versionbits.h>
 
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 
 using node::NodeContext;
 
-COutPoint generatetoaddress(const NodeContext& node, const std::string& address)
+namespace {
+template <typename Result, typename Start>
+Result WaitForAsync(Start&& start)
+{
+    std::promise<Result> promise;
+    auto future{promise.get_future()};
+    auto handler{start([&promise](Result result) mutable {
+        promise.set_value(std::move(result));
+    })};
+    (void)handler;
+    return future.get();
+}
+} // namespace
+
+std::unique_ptr<interfaces::BlockTemplate> CreateNewBlock(interfaces::Mining& mining,
+                                                          const node::BlockCreateOptions& options,
+                                                          bool cooldown)
+{
+    auto result{WaitForAsync<interfaces::Mining::CreateBlockResult>([&](interfaces::Mining::CreateBlockFn fn) {
+        return mining.createNewBlockAsync(options, cooldown, std::move(fn));
+    })};
+    if (!result) throw std::runtime_error{util::ErrorString(result).original};
+    return std::move(*result);
+}
+
+std::unique_ptr<interfaces::BlockTemplate> WaitNext(interfaces::BlockTemplate& block_template,
+                                                    node::BlockWaitOptions options)
+{
+    return WaitForAsync<std::unique_ptr<interfaces::BlockTemplate>>([&](interfaces::BlockTemplate::NextTemplateFn fn) {
+        return block_template.watchNext(options, std::move(fn));
+    });
+}
+
+bool SubmitSolution(interfaces::BlockTemplate& block_template,
+                    uint32_t version,
+                    uint32_t timestamp,
+                    uint32_t nonce,
+                    CTransactionRef coinbase)
+{
+    return WaitForAsync<bool>([&](interfaces::BlockTemplate::SubmitSolutionFn fn) {
+        return block_template.submitSolutionAsync(version, timestamp, nonce, std::move(coinbase), std::move(fn));
+    });
+}
+
+BlockTestResult CheckBlock(interfaces::Mining& mining, CBlock block, node::BlockCheckOptions options)
+{
+    return WaitForAsync<BlockTestResult>([&](std::function<void(BlockTestResult)> done) {
+        return mining.checkBlockAsync(std::move(block), options, [done = std::move(done)](bool valid, std::string reason, std::string debug) mutable {
+            done({valid, std::move(reason), std::move(debug)});
+        });
+    });
+}
+
+BlockTestResult SubmitBlock(interfaces::Mining& mining, CBlock block)
+{
+    return WaitForAsync<BlockTestResult>([&](std::function<void(BlockTestResult)> done) {
+        return mining.submitBlockAsync(std::move(block), [done = std::move(done)](bool accepted, std::string reason, std::string debug) mutable {
+            done({accepted, std::move(reason), std::move(debug)});
+        });
+    });
+}
+
+std::optional<interfaces::BlockRef> WaitTipChanged(interfaces::Mining& mining,
+                                                   uint256 current_tip,
+                                                   MillisecondsDouble timeout)
+{
+    return WaitForAsync<std::optional<interfaces::BlockRef>>([&](interfaces::Mining::TipChangedFn fn) {
+        return mining.watchTip(current_tip, timeout, std::move(fn));
+    });
+}
+
+COutPoint generatetoaddress(NodeContext& node, const std::string& address)
 {
     const auto dest = DecodeDestination(address);
     assert(IsValidDestination(dest));
@@ -74,7 +149,7 @@ std::vector<std::shared_ptr<CBlock>> CreateBlockChain(size_t total_height, const
     return ret;
 }
 
-COutPoint MineBlock(const NodeContext& node, const node::BlockCreateOptions& assembler_options)
+COutPoint MineBlock(NodeContext& node, const node::BlockCreateOptions& assembler_options)
 {
     auto block = PrepareBlock(node, assembler_options);
     auto valid = MineBlock(node, block);
@@ -98,7 +173,7 @@ protected:
     }
 };
 
-COutPoint MineBlock(const NodeContext& node, std::shared_ptr<CBlock>& block)
+COutPoint MineBlock(NodeContext& node, std::shared_ptr<CBlock>& block)
 {
     while (!CheckProofOfWork(block->GetHash(), block->nBits, Params().GetConsensus())) {
         ++block->nNonce;
@@ -108,7 +183,7 @@ COutPoint MineBlock(const NodeContext& node, std::shared_ptr<CBlock>& block)
     return ProcessBlock(node, block);
 }
 
-COutPoint ProcessBlock(const NodeContext& node, const std::shared_ptr<CBlock>& block)
+COutPoint ProcessBlock(NodeContext& node, const std::shared_ptr<CBlock>& block)
 {
     auto& chainman{*Assert(node.chainman)};
     const auto old_height = WITH_LOCK(chainman.GetMutex(), return chainman.ActiveHeight());
@@ -127,11 +202,11 @@ COutPoint ProcessBlock(const NodeContext& node, const std::shared_ptr<CBlock>& b
     return {};
 }
 
-std::shared_ptr<CBlock> PrepareBlock(const NodeContext& node,
+std::shared_ptr<CBlock> PrepareBlock(NodeContext& node,
                                      const node::BlockCreateOptions& assembler_options)
 {
     auto mining = interfaces::MakeMining(node);
-    auto block_template = mining->createNewBlock(assembler_options, /*cooldown=*/false);
+    auto block_template = CreateNewBlock(*mining, assembler_options, /*cooldown=*/false);
     auto block = std::make_shared<CBlock>(Assert(block_template)->getBlock());
 
     LOCK(cs_main);

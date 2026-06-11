@@ -11,6 +11,7 @@
 #include <ipc/protocol.h>
 #include <logging.h>
 #include <tinyformat.h>
+#include <unistd.h>
 #include <util/fs.h>
 
 #include <csignal>
@@ -21,7 +22,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -49,12 +49,39 @@ void IgnoreCtrlC(std::string message)
 #endif
 }
 
+class SpawnedInit final : public interfaces::Init
+{
+public:
+    SpawnedInit(std::unique_ptr<interfaces::Init> init, std::function<void()> cleanup)
+        : m_init(std::move(init)), m_cleanup(std::move(cleanup))
+    {
+    }
+
+    ~SpawnedInit() override
+    {
+        m_init.reset();
+        if (m_cleanup) m_cleanup();
+    }
+
+    std::unique_ptr<interfaces::Node> makeNode() override { return m_init->makeNode(); }
+    std::unique_ptr<interfaces::Chain> makeChain() override { return m_init->makeChain(); }
+    std::unique_ptr<interfaces::Mining> makeMining() override { return m_init->makeMining(); }
+    std::unique_ptr<interfaces::Echo> makeEcho() override { return m_init->makeEcho(); }
+    void stop() override { m_init->stop(); }
+    interfaces::Ipc* ipc() override { return m_init->ipc(); }
+    bool canListenIpc() override { return m_init->canListenIpc(); }
+    const char* exeName() override { return m_init->exeName(); }
+
+private:
+    std::unique_ptr<interfaces::Init> m_init;
+    std::function<void()> m_cleanup;
+};
+
 class IpcImpl : public interfaces::Ipc
 {
 public:
     IpcImpl(const char* exe_name, const char* process_argv0, interfaces::Init& init)
-        : m_exe_name(exe_name), m_process_argv0(process_argv0), m_init(init),
-          m_protocol(ipc::capnp::MakeCapnpProtocol()), m_process(ipc::MakeProcess())
+        : m_exe_name(exe_name), m_process_argv0(process_argv0), m_init(init), m_protocol(ipc::capnp::MakeCapnpProtocol()), m_process(ipc::MakeProcess())
     {
     }
     std::unique_ptr<interfaces::Init> spawnProcess(const char* new_exe_name) override
@@ -62,12 +89,10 @@ public:
         int pid;
         int fd = m_process->spawn(new_exe_name, m_process_argv0, pid);
         LogDebug(::BCLog::IPC, "Process %s pid %i launched\n", new_exe_name, pid);
-        auto init = m_protocol->connect(fd, m_exe_name);
-        Ipc::addCleanup(*init, [this, new_exe_name, pid] {
+        return std::make_unique<SpawnedInit>(m_protocol->connect(fd, m_exe_name), [this, new_exe_name, pid] {
             int status = m_process->waitSpawned(pid);
             LogDebug(::BCLog::IPC, "Process %s pid %i exited with status %i\n", new_exe_name, pid, status);
         });
-        return init;
     }
     bool startSpawnedProcess(int argc, char* argv[], int& exit_status) override
     {
@@ -100,8 +125,8 @@ public:
                 }
                 throw;
             } catch (const std::invalid_argument&) {
-               // Catch 'Unix address path "..." exceeded maximum socket path length' error
-               return nullptr;
+                // Catch 'Unix address path "..." exceeded maximum socket path length' error
+                return nullptr;
             }
         } else {
             fd = m_process->connect(gArgs.GetDataDirNet(), "bitcoin-node", address);
@@ -116,10 +141,6 @@ public:
     void disconnectIncoming() override
     {
         m_protocol->disconnectIncoming();
-    }
-    void addCleanup(std::type_index type, void* iface, std::function<void()> cleanup) override
-    {
-        m_protocol->addCleanup(type, iface, std::move(cleanup));
     }
     Context& context() override { return m_protocol->context(); }
     const char* m_exe_name;

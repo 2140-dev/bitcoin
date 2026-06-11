@@ -4,16 +4,16 @@
 
 #include <ipc/process.h>
 #include <ipc/test/ipc_test.h>
-
 #include <test/util/common.h>
 #include <test/util/setup_common.h>
+
 #include <boost/test/unit_test.hpp>
 
 BOOST_FIXTURE_TEST_SUITE(ipc_tests, BasicTestingSetup)
 BOOST_AUTO_TEST_CASE(ipc_tests)
 {
-    IpcPipeTest();
     IpcSocketPairTest();
+    IpcNativeMiningWatchTest();
     IpcSocketTest(m_args.GetDataDirNet());
 }
 

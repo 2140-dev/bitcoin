@@ -196,6 +196,14 @@ if [ "${RUN_TIDY}" = "true" ]; then
 fi
 
 if [[ "${RUN_IWYU}" == true ]]; then
+  mkdir -p "${BASE_BUILD_DIR}/src/node/data"
+  cmake -DRAW_SOURCE_PATH="${BASE_ROOT_DIR}/src/node/data/ip_asn.dat" \
+        -DHEADER_PATH="${BASE_BUILD_DIR}/src/node/data/ip_asn.dat.h" \
+        -DRAW_NAMESPACE=node::data \
+        -P "${BASE_ROOT_DIR}/cmake/script/GenerateHeaderFromRaw.cmake"
+  # shellcheck disable=SC2086
+  cmake --build "${BASE_BUILD_DIR}" "$MAKEJOBS" --target bitcoin_ipc
+
   # TODO: Consider enforcing IWYU across the entire codebase.
   FILES_WITH_ENFORCED_IWYU="/src/(((crypto|index|kernel|primitives|script|univalue/(lib|test)|util)/.*|bench/(block_assemble|connectblock)|common/license_info|node/(blockstorage|interfaces|miner|mining_args|utxo_snapshot)|rpc/mining|clientversion|core_io|signet|init)\\.cpp)"
   jq --arg patterns "$FILES_WITH_ENFORCED_IWYU" 'map(select(.file | test($patterns)))' "${BASE_BUILD_DIR}/compile_commands.json" > "${BASE_BUILD_DIR}/compile_commands_iwyu_errors.json"

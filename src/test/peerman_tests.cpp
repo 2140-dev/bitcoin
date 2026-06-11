@@ -11,6 +11,7 @@
 #include <primitives/block.h>
 #include <protocol.h>
 #include <sync.h>
+#include <test/util/mining.h>
 #include <test/util/setup_common.h>
 #include <chainstate.h>
 
@@ -29,7 +30,7 @@ static void mineBlock(node::NodeContext& node, std::chrono::seconds block_time)
     auto curr_time = GetTime<std::chrono::seconds>();
     SetMockTime(block_time); // update time so the block is created with it
     auto mining{interfaces::MakeMining(node)};
-    auto block_template{mining->createNewBlock({}, /*cooldown=*/false)};
+    auto block_template{CreateNewBlock(*mining, {}, /*cooldown=*/false)};
     BOOST_REQUIRE(block_template);
     CBlock block{block_template->getBlock()};
     while (!CheckProofOfWork(block.GetHash(), block.nBits, node.chainman->GetConsensus())) ++block.nNonce;

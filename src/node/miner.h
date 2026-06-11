@@ -15,6 +15,7 @@
 #include <util/feefrac.h>
 #include <util/time.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -134,20 +135,6 @@ void AddMerkleRootAndCoinbase(CBlock& block, CTransactionRef coinbase, uint32_t 
 //! Returns whether ProcessNewBlock accepted the block.
 bool SubmitBlock(ChainstateManager& chainman, const std::shared_ptr<const CBlock>& block, bool* new_block, std::string& reason, std::string& debug);
 
-/* Interrupt a blocking call. */
-void InterruptWait(KernelNotifications& kernel_notifications, bool& interrupt_wait);
-/**
- * Return a new block template when fees rise to a certain threshold or after a
- * new tip; return nullopt if timeout is reached.
- */
-std::unique_ptr<CBlockTemplate> WaitAndCreateNewBlock(ChainstateManager& chainman,
-                                                      KernelNotifications& kernel_notifications,
-                                                      CTxMemPool* mempool,
-                                                      const std::unique_ptr<CBlockTemplate>& block_template,
-                                                      const BlockWaitOptions& wait_options,
-                                                      const BlockCreateOptions& create_options,
-                                                      bool& interrupt_wait);
-
 /* Locks cs_main and returns the block hash and block height of the active chain if it exists; otherwise, returns nullopt.*/
 std::optional<BlockRef> GetTip(ChainstateManager& chainman);
 
@@ -155,7 +142,7 @@ std::optional<BlockRef> GetTip(ChainstateManager& chainman);
  * Returns the current tip, or nullopt if the node is shutting down or interrupt()
  * is called.
  */
-std::optional<BlockRef> WaitTipChanged(ChainstateManager& chainman, KernelNotifications& kernel_notifications, const uint256& current_tip, MillisecondsDouble& timeout, bool& interrupt);
+std::optional<BlockRef> WaitTipChanged(ChainstateManager& chainman, KernelNotifications& kernel_notifications, const uint256& current_tip, MillisecondsDouble& timeout, std::atomic_bool& interrupt);
 
 /**
  * Wait while the best known header extends the current chain tip AND at least
@@ -176,7 +163,7 @@ std::optional<BlockRef> WaitTipChanged(ChainstateManager& chainman, KernelNotifi
  *
  * @returns false if interrupted.
  */
-bool CooldownIfHeadersAhead(ChainstateManager& chainman, KernelNotifications& kernel_notifications, const BlockRef& last_tip, bool& interrupt_mining);
+bool CooldownIfHeadersAhead(ChainstateManager& chainman, KernelNotifications& kernel_notifications, const BlockRef& last_tip, std::atomic_bool& interrupt_mining);
 } // namespace node
 
 #endif // BITCOIN_NODE_MINER_H
