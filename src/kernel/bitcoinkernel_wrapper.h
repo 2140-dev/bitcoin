@@ -7,11 +7,13 @@
 
 #include <kernel/bitcoinkernel.h>
 
+#include <algorithm>
 #include <array>
 #include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -243,7 +245,7 @@ concept IndexedContainer = requires(const Container& c, SizeFunc size_func, GetF
 
 template <typename Container, auto SizeFunc, auto GetFunc>
     requires IndexedContainer<Container, decltype(SizeFunc), decltype(GetFunc)>
-class Range
+class Range : public std::ranges::view_interface<Range<Container, SizeFunc, GetFunc>>
 {
 public:
     using value_type = std::invoke_result_t<decltype(GetFunc), const Container&, size_t>;
@@ -268,8 +270,6 @@ public:
 
     size_t size() const { return std::invoke(SizeFunc, *m_container); }
 
-    bool empty() const { return size() == 0; }
-
     value_type operator[](size_t index) const { return std::invoke(GetFunc, *m_container, index); }
 
     value_type at(size_t index) const
@@ -279,9 +279,6 @@ public:
         }
         return (*this)[index];
     }
-
-    value_type front() const { return (*this)[0]; }
-    value_type back() const { return (*this)[size() - 1]; }
 };
 
 #define MAKE_RANGE_METHOD(method_name, ContainerType, SizeFunc, GetFunc, container_expr) \
@@ -762,6 +759,12 @@ public:
         return BlockHash{btck_block_header_get_hash(impl())};
     }
 
+    //! Two block headers are equal when they hash to the same block.
+    bool operator==(const BlockHeaderApi& other) const
+    {
+        return Hash() == other.Hash();
+    }
+
     BlockHashView PrevHash() const
     {
         return BlockHashView{btck_block_header_get_prev_hash(impl())};
@@ -908,46 +911,106 @@ public:
     }
 };
 
-class BlockTreeEntry : public View<btck_BlockTreeEntry>
+class Chain : public std::ranges::view_interface<Chain>
 {
+    const btck_Chain* m_ptr;
+
 public:
-    BlockTreeEntry(const btck_BlockTreeEntry* entry)
-        : View{entry}
+    //! A Chain is a non-owning snapshot over a borrowed btck_Chain, valid for as
+    //! long as the chainstate manager that produced it.
+    explicit Chain(const btck_Chain* ptr) : m_ptr{ptr} {}
+
+    const btck_Chain* get() const { return m_ptr; }
+
+    bool operator==(const Chain& other) const
     {
+        return btck_chain_equals(get(), other.get()) != 0;
     }
 
-    bool operator==(const BlockTreeEntry& other) const
+    //! A chain is a random-access range of the block headers of its blocks, from
+    //! the genesis header (front()) up to and including the tip header (back()).
+    using value_type = BlockHeader;
+    using difference_type = std::ptrdiff_t;
+    using iterator = Iterator<Chain, BlockHeader>;
+    using const_iterator = iterator;
+
+    iterator begin() const { return iterator(this, 0); }
+    iterator end() const { return iterator(this, size()); }
+    const_iterator cbegin() const { return begin(); }
+    const_iterator cend() const { return end(); }
+
+    size_t size() const { return static_cast<size_t>(CountEntries()); }
+
+    BlockHeader operator[](size_t index) const { return GetHeader(static_cast<int32_t>(index)); }
+
+    BlockHeader at(size_t index) const
     {
-        return btck_block_tree_entry_equals(get(), other.get()) != 0;
+        if (index >= size()) {
+            throw std::out_of_range("Index out of range");
+        }
+        return (*this)[index];
     }
 
-    std::optional<BlockTreeEntry> GetPrevious() const
+    int32_t Height() const
     {
-        auto entry{btck_block_tree_entry_get_previous(get())};
-        if (!entry) return std::nullopt;
-        return entry;
+        return btck_chain_get_height(get());
     }
 
-    int32_t GetHeight() const
+    //! Number of blocks in the chain (tip height + 1, including the genesis block).
+    int32_t CountEntries() const
     {
-        return btck_block_tree_entry_get_height(get());
+        return btck_chain_get_height(get()) + 1;
     }
 
-    BlockHashView GetHash() const
+    BlockHeader GetHeader(int32_t height) const
     {
-        return BlockHashView{btck_block_tree_entry_get_block_hash(get())};
+        auto header{btck_chain_get_block_header(get(), height)};
+        if (!header) throw std::runtime_error("No block in the chain at the provided height");
+        return header;
     }
 
-    BlockHeader GetHeader() const
+    BlockHashView GetHash(int32_t height) const
     {
-        return BlockHeader{btck_block_tree_entry_get_block_header(get())};
+        auto hash{btck_chain_get_block_hash(get(), height)};
+        if (!hash) throw std::runtime_error("No block in the chain at the provided height");
+        return BlockHashView{hash};
     }
 
-    BlockTreeEntry GetAncestor(int32_t height) const
+    //! The sub-chain ending at the given height (a prefix of this chain), or the
+    //! empty chain if the height is out of range. O(log n).
+    Chain GetAncestor(int32_t height) const
     {
-        return BlockTreeEntry{btck_block_tree_entry_get_ancestor(get(), height)};
+        return Chain{btck_chain_get_ancestor(get(), height)};
     }
 
+    //! The parent chain (this chain with its tip removed), or the empty chain at
+    //! genesis. O(1).
+    Chain Parent() const
+    {
+        return Chain{btck_chain_get_parent(get())};
+    }
+
+    bool StartsWith(const Chain& prefix) const
+    {
+        return btck_chain_starts_with(get(), prefix.get()) != 0;
+    }
+
+    Chain FindFork(const Chain& other) const
+    {
+        return Chain{btck_chain_find_fork(get(), other.get())};
+    }
+
+    std::ranges::mismatch_result<iterator, iterator>
+    Mismatch(const Chain& other) const
+    {
+        auto fork{FindFork(other)};
+        auto n{static_cast<difference_type>(fork.Height() + 1)};
+        return {begin() + n, other.begin() + n};
+    }
+
+    //! Convenience accessors for the block at the chain's tip.
+    BlockHeader TipHeader() const { return GetHeader(Height()); }
+    BlockHashView TipHash() const { return GetHash(Height()); }
 };
 
 class KernelNotifications
@@ -955,7 +1018,7 @@ class KernelNotifications
 public:
     virtual ~KernelNotifications() = default;
 
-    virtual void BlockTipHandler(SynchronizationState state, BlockTreeEntry entry, double verification_progress) {}
+    virtual void BlockTipHandler(SynchronizationState state, Chain chain, double verification_progress) {}
 
     virtual void HeaderTipHandler(SynchronizationState state, int64_t height, int64_t timestamp, bool presync) {}
 
@@ -1046,11 +1109,11 @@ public:
 
     virtual void BlockChecked(Block block, BlockValidationStateView state) {}
 
-    virtual void PowValidBlock(BlockTreeEntry entry, Block block) {}
+    virtual void PowValidBlock(Chain chain, Block block) {}
 
-    virtual void BlockConnected(Block block, BlockTreeEntry entry) {}
+    virtual void BlockConnected(Block block, Chain chain) {}
 
-    virtual void BlockDisconnected(Block block, BlockTreeEntry entry) {}
+    virtual void BlockDisconnected(Block block, Chain chain) {}
 };
 
 class ChainParams : public Handle<btck_ChainParameters, btck_chain_parameters_copy, btck_chain_parameters_destroy>
@@ -1086,7 +1149,7 @@ public:
             btck_NotificationInterfaceCallbacks{
                 .user_data = heap_notifications.release(),
                 .user_data_destroy = +[](void* user_data) { delete static_cast<user_type>(user_data); },
-                .block_tip = +[](void* user_data, btck_SynchronizationState state, const btck_BlockTreeEntry* entry, double verification_progress) { (*static_cast<user_type>(user_data))->BlockTipHandler(static_cast<SynchronizationState>(state), BlockTreeEntry{entry}, verification_progress); },
+                .block_tip = +[](void* user_data, btck_SynchronizationState state, const btck_Chain* chain, double verification_progress) { (*static_cast<user_type>(user_data))->BlockTipHandler(static_cast<SynchronizationState>(state), Chain{chain}, verification_progress); },
                 .header_tip = +[](void* user_data, btck_SynchronizationState state, int64_t height, int64_t timestamp, int presync) { (*static_cast<user_type>(user_data))->HeaderTipHandler(static_cast<SynchronizationState>(state), height, timestamp, presync == 1); },
                 .progress = +[](void* user_data, const char* title, size_t title_len, int progress_percent, int resume_possible) { (*static_cast<user_type>(user_data))->ProgressHandler({title, title_len}, progress_percent, resume_possible == 1); },
                 .warning_set = +[](void* user_data, btck_Warning warning, const char* message, size_t message_len) { (*static_cast<user_type>(user_data))->WarningSetHandler(static_cast<Warning>(warning), {message, message_len}); },
@@ -1108,9 +1171,9 @@ public:
                 .user_data = heap_vi.release(),
                 .user_data_destroy = +[](void* user_data) { delete static_cast<user_type>(user_data); },
                 .block_checked = +[](void* user_data, btck_Block* block, const btck_BlockValidationState* state) { (*static_cast<user_type>(user_data))->BlockChecked(Block{block}, BlockValidationStateView{state}); },
-                .pow_valid_block = +[](void* user_data, btck_Block* block, const btck_BlockTreeEntry* entry) { (*static_cast<user_type>(user_data))->PowValidBlock(BlockTreeEntry{entry}, Block{block}); },
-                .block_connected = +[](void* user_data, btck_Block* block, const btck_BlockTreeEntry* entry) { (*static_cast<user_type>(user_data))->BlockConnected(Block{block}, BlockTreeEntry{entry}); },
-                .block_disconnected = +[](void* user_data, btck_Block* block, const btck_BlockTreeEntry* entry) { (*static_cast<user_type>(user_data))->BlockDisconnected(Block{block}, BlockTreeEntry{entry}); },
+                .pow_valid_block = +[](void* user_data, btck_Block* block, const btck_Chain* chain) { (*static_cast<user_type>(user_data))->PowValidBlock(Chain{chain}, Block{block}); },
+                .block_connected = +[](void* user_data, btck_Block* block, const btck_Chain* chain) { (*static_cast<user_type>(user_data))->BlockConnected(Block{block}, Chain{chain}); },
+                .block_disconnected = +[](void* user_data, btck_Block* block, const btck_Chain* chain) { (*static_cast<user_type>(user_data))->BlockDisconnected(Block{block}, Chain{chain}); },
             });
     }
 };
@@ -1159,37 +1222,6 @@ public:
         btck_chainstate_manager_options_update_chainstate_db_in_memory(get(), chainstate_db_in_memory);
     }
 };
-
-class ChainView : public View<btck_Chain>
-{
-public:
-    explicit ChainView(const btck_Chain* ptr) : View{ptr} {}
-
-    int32_t Height() const
-    {
-        return btck_chain_get_height(get());
-    }
-
-    int32_t CountEntries() const
-    {
-        return btck_chain_get_height(get()) + 1;
-    }
-
-    BlockTreeEntry GetByHeight(int32_t height) const
-    {
-        auto index{btck_chain_get_by_height(get(), height)};
-        if (!index) throw std::runtime_error("No entry in the chain at the provided height");
-        return index;
-    }
-
-    bool Contains(BlockTreeEntry& entry) const
-    {
-        return btck_chain_contains(get(), entry.get());
-    }
-
-    MAKE_RANGE_METHOD(Entries, ChainView, &ChainView::CountEntries, &ChainView::GetByHeight, *this)
-};
-
 template <typename Derived>
 class CoinApi
 {
@@ -1325,33 +1357,32 @@ public:
         return BlockValidationState{state};
     }
 
-    ChainView GetChain() const
+    Chain GetChain() const
     {
-        return ChainView{btck_chainstate_manager_get_active_chain(get())};
+        return Chain{btck_chainstate_manager_get_active_chain(get())};
     }
 
-    std::optional<BlockTreeEntry> GetBlockTreeEntry(const BlockHash& block_hash) const
+    Chain Find(const BlockHash& block_hash) const
     {
-        auto entry{btck_chainstate_manager_get_block_tree_entry_by_hash(get(), block_hash.get())};
-        if (!entry) return std::nullopt;
-        return entry;
+        auto chain{btck_chainstate_manager_find(get(), block_hash.get())};
+        return Chain{chain};
     }
 
-    BlockTreeEntry GetBestEntry() const
+    Chain GetBestChain() const
     {
-        return btck_chainstate_manager_get_best_entry(get());
+        return Chain{btck_chainstate_manager_get_best_chain(get())};
     }
 
-    std::optional<Block> ReadBlock(const BlockTreeEntry& entry) const
+    std::optional<Block> ReadBlock(const Chain& chain) const
     {
-        auto block{btck_block_read(get(), entry.get())};
+        auto block{btck_block_read(get(), chain.get())};
         if (!block) return std::nullopt;
         return block;
     }
 
-    BlockSpentOutputs ReadBlockSpentOutputs(const BlockTreeEntry& entry) const
+    BlockSpentOutputs ReadBlockSpentOutputs(const Chain& chain) const
     {
-        return btck_block_spent_outputs_read(get(), entry.get());
+        return btck_block_spent_outputs_read(get(), chain.get());
     }
 };
 

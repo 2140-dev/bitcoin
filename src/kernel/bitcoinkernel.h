@@ -193,18 +193,6 @@ typedef struct btck_ContextOptions btck_ContextOptions;
  */
 typedef struct btck_Context btck_Context;
 
-/**
- * Opaque data structure for holding a block tree entry.
- *
- * This is a pointer to an element in the block index currently in memory of
- * the chainstate manager. It is valid for the lifetime of the chainstate
- * manager it was retrieved from. The entry is part of a tree-like structure
- * that is maintained internally. Every entry, besides the genesis, points to a
- * single parent. Multiple entries may share a parent, thus forming a tree.
- * Each entry corresponds to a single block and may be used to retrieve its
- * data and validation status.
- */
-typedef struct btck_BlockTreeEntry btck_BlockTreeEntry;
 
 /**
  * Opaque data structure for holding options for creating a new chainstate
@@ -245,8 +233,17 @@ typedef struct btck_BlockValidationState btck_BlockValidationState;
 typedef struct btck_ConsensusParams btck_ConsensusParams;
 
 /**
- * Opaque data structure for holding the currently known best-chain associated
- * with a chainstate.
+ * Opaque data structure for holding a chain.
+ *
+ * A chain is the linear sequence of blocks from the genesis block up to and
+ * including a particular block (its tip). Because every block has a unique
+ * path back to the genesis block, a chain is fully determined by its tip.
+ *
+ * This is a view into the block index currently held in memory by the
+ * chainstate manager and is valid for the lifetime of the chainstate manager
+ * it was retrieved from. The chains exposed by this API are snapshots: once
+ * obtained, a chain always describes the same sequence of blocks, even as the
+ * chainstate manager's active chain advances.
  */
 typedef struct btck_Chain btck_Chain;
 
@@ -358,7 +355,7 @@ typedef void (*btck_DestroyCallback)(void* user_data);
 /**
  * Function signatures for the kernel notifications.
  */
-typedef void (*btck_NotifyBlockTip)(void* user_data, btck_SynchronizationState state, const btck_BlockTreeEntry* entry, double verification_progress);
+typedef void (*btck_NotifyBlockTip)(void* user_data, btck_SynchronizationState state, const btck_Chain* chain, double verification_progress);
 typedef void (*btck_NotifyHeaderTip)(void* user_data, btck_SynchronizationState state, int64_t height, int64_t timestamp, int presync);
 typedef void (*btck_NotifyProgress)(void* user_data, const char* title, size_t title_len, int progress_percent, int resume_possible);
 typedef void (*btck_NotifyWarningSet)(void* user_data, btck_Warning warning, const char* message, size_t message_len);
@@ -370,9 +367,9 @@ typedef void (*btck_NotifyFatalError)(void* user_data, const char* message, size
  * Function signatures for the validation interface.
  */
 typedef void (*btck_ValidationInterfaceBlockChecked)(void* user_data, btck_Block* block, const btck_BlockValidationState* state);
-typedef void (*btck_ValidationInterfacePoWValidBlock)(void* user_data, btck_Block* block, const btck_BlockTreeEntry* entry);
-typedef void (*btck_ValidationInterfaceBlockConnected)(void* user_data, btck_Block* block, const btck_BlockTreeEntry* entry);
-typedef void (*btck_ValidationInterfaceBlockDisconnected)(void* user_data, btck_Block* block, const btck_BlockTreeEntry* entry);
+typedef void (*btck_ValidationInterfacePoWValidBlock)(void* user_data, btck_Block* block, const btck_Chain* chain);
+typedef void (*btck_ValidationInterfaceBlockConnected)(void* user_data, btck_Block* block, const btck_Chain* chain);
+typedef void (*btck_ValidationInterfaceBlockDisconnected)(void* user_data, btck_Block* block, const btck_Chain* chain);
 
 /**
  * Function signature for serializing data.
@@ -1075,72 +1072,6 @@ BITCOINKERNEL_API void btck_context_destroy(btck_Context* context);
 
 ///@}
 
-/** @name BlockTreeEntry
- * Functions for working with block tree entries.
- */
-///@{
-
-/**
- * @brief Returns the previous block tree entry in the tree, or null if the current
- * block tree entry is the genesis block.
- *
- * @param[in] block_tree_entry Non-null.
- * @return                     The previous block tree entry, or null on error or if the current block tree entry is the genesis block.
- */
-BITCOINKERNEL_API const btck_BlockTreeEntry* btck_block_tree_entry_get_previous(
-    const btck_BlockTreeEntry* block_tree_entry) BITCOINKERNEL_ARG_NONNULL(1);
-
-/**
- * @brief Return the btck_BlockHeader associated with this entry.
- *
- * @param[in] block_tree_entry Non-null.
- * @return                     btck_BlockHeader.
- */
-BITCOINKERNEL_API btck_BlockHeader* BITCOINKERNEL_WARN_UNUSED_RESULT btck_block_tree_entry_get_block_header(
-    const btck_BlockTreeEntry* block_tree_entry) BITCOINKERNEL_ARG_NONNULL(1);
-
-/**
- * @brief Return the height of a certain block tree entry.
- *
- * @param[in] block_tree_entry Non-null.
- * @return                     The block height.
- */
-BITCOINKERNEL_API int32_t btck_block_tree_entry_get_height(
-    const btck_BlockTreeEntry* block_tree_entry) BITCOINKERNEL_ARG_NONNULL(1);
-
-/**
- * @brief Return the block hash associated with a block tree entry.
- *
- * @param[in] block_tree_entry Non-null.
- * @return                     The block hash.
- */
-BITCOINKERNEL_API const btck_BlockHash* btck_block_tree_entry_get_block_hash(
-    const btck_BlockTreeEntry* block_tree_entry) BITCOINKERNEL_ARG_NONNULL(1);
-
-/**
- * @brief Check if two block tree entries are equal. Two block tree entries are equal when they
- * point to the same block.
- *
- * @param[in] entry1 Non-null.
- * @param[in] entry2 Non-null.
- * @return           1 if the block tree entries are equal, 0 otherwise.
- */
-BITCOINKERNEL_API int btck_block_tree_entry_equals(
-    const btck_BlockTreeEntry* entry1, const btck_BlockTreeEntry* entry2) BITCOINKERNEL_ARG_NONNULL(1, 2);
-
-/**
- * @brief Return the ancestor of a btck_BlockTreeEntry at the given height.
- *
- * @param[in] block_tree_entry Non-null.
- * @param[in] height           The height of the requested ancestor.
- * @return                     The ancestor at the given height.
- */
-BITCOINKERNEL_API const btck_BlockTreeEntry* btck_block_tree_entry_get_ancestor(
-    const btck_BlockTreeEntry* block_tree_entry,
-    int32_t height) BITCOINKERNEL_ARG_NONNULL(1);
-
-///@}
-
 /** @name ChainstateManagerOptions
  * Functions for working with chainstate manager options.
  */
@@ -1237,13 +1168,14 @@ BITCOINKERNEL_API btck_ChainstateManager* BITCOINKERNEL_WARN_UNUSED_RESULT btck_
     const btck_ChainstateManagerOptions* chainstate_manager_options) BITCOINKERNEL_ARG_NONNULL(1);
 
 /**
- * @brief Get the btck_BlockTreeEntry whose associated btck_BlockHeader has the most
- * known cumulative proof of work.
+ * @brief Get the chain ending at the block with the most known cumulative
+ * proof of work. This block may not be part of the active chain, e.g. if its
+ * data has not been validated yet.
  *
  * @param[in] chainstate_manager Non-null.
- * @return                       The btck_BlockTreeEntry, or null if no block headers have been loaded.
+ * @return                       The chain, or null if no block headers have been loaded.
  */
-BITCOINKERNEL_API const btck_BlockTreeEntry* btck_chainstate_manager_get_best_entry(
+BITCOINKERNEL_API const btck_Chain* btck_chainstate_manager_get_best_chain(
     const btck_ChainstateManager* chainstate_manager) BITCOINKERNEL_ARG_NONNULL(1);
 
 /**
@@ -1296,15 +1228,11 @@ BITCOINKERNEL_API int BITCOINKERNEL_WARN_UNUSED_RESULT btck_chainstate_manager_p
     int* new_block) BITCOINKERNEL_ARG_NONNULL(1, 2, 3);
 
 /**
- * @brief Returns the best known currently active chain. Its lifetime is
- * dependent on the chainstate manager. It can be thought of as a view on a
- * vector of block tree entries that form the best chain. The returned chain
- * reference always points to the currently active best chain. However, state
- * transitions within the chainstate manager (e.g., processing blocks) will
- * update the chain's contents. Data retrieved from this chain is only
- * consistent up to the point when new data is processed in the chainstate
- * manager. It is the user's responsibility to guard against these
- * inconsistencies.
+ * @brief Returns the currently active chain.
+ *
+ * The returned chain ends at the active tip at the time of this call. Like
+ * all chains in this API, it is a snapshot: subsequent state transitions in
+ * the chainstate manager do not change the contents of this chain object.
  *
  * @param[in] chainstate_manager Non-null.
  * @return                       The chain.
@@ -1313,14 +1241,14 @@ BITCOINKERNEL_API const btck_Chain* btck_chainstate_manager_get_active_chain(
     const btck_ChainstateManager* chainstate_manager) BITCOINKERNEL_ARG_NONNULL(1);
 
 /**
- * @brief Retrieve a block tree entry by its block hash.
+ * @brief Retrieve the chain ending at the block with the given block hash.
  *
  * @param[in] chainstate_manager Non-null.
  * @param[in] block_hash         Non-null.
- * @return                       The block tree entry of the block with the passed in hash, or null if
- *                               the block hash is not found.
+ * @return                       The chain ending at the block with the passed in hash, or the
+ *                               empty chain (null) if the block hash is not found.
  */
-BITCOINKERNEL_API const btck_BlockTreeEntry* btck_chainstate_manager_get_block_tree_entry_by_hash(
+BITCOINKERNEL_API const btck_Chain* btck_chainstate_manager_find(
     const btck_ChainstateManager* chainstate_manager,
     const btck_BlockHash* block_hash) BITCOINKERNEL_ARG_NONNULL(1, 2);
 
@@ -1337,16 +1265,17 @@ BITCOINKERNEL_API void btck_chainstate_manager_destroy(btck_ChainstateManager* c
 ///@{
 
 /**
- * @brief Reads the block the passed in block tree entry points to from disk and
+ * @brief Reads the block at the tip of the passed in chain from disk and
  * returns it.
  *
  * @param[in] chainstate_manager Non-null.
- * @param[in] block_tree_entry   Non-null.
+ * @param[in] chain              The chain whose tip block to read; the empty chain (null) has no
+ *                               tip and yields null.
  * @return                       The read out block, or null on error.
  */
 BITCOINKERNEL_API btck_Block* BITCOINKERNEL_WARN_UNUSED_RESULT btck_block_read(
     const btck_ChainstateManager* chainstate_manager,
-    const btck_BlockTreeEntry* block_tree_entry) BITCOINKERNEL_ARG_NONNULL(1, 2);
+    const btck_Chain* chain) BITCOINKERNEL_ARG_NONNULL(1);
 
 /**
  * @brief Parse a serialized raw block into a new block object.
@@ -1505,43 +1434,105 @@ BITCOINKERNEL_API void btck_block_validation_state_destroy(
 ///@}
 
 /** @name Chain
- * Functions for working with the chain
+ * Functions for working with the chain.
+ *
+ * A null btck_Chain* denotes the empty chain: a chain containing no blocks.
  */
 ///@{
 
 /**
  * @brief Return the height of the tip of the chain.
  *
- * @param[in] chain Non-null.
- * @return          The current height.
+ * @param[in] chain The chain, or null for the empty chain.
+ * @return          The current height, or -1 for the empty chain.
  */
 BITCOINKERNEL_API int32_t btck_chain_get_height(
-    const btck_Chain* chain) BITCOINKERNEL_ARG_NONNULL(1);
+    const btck_Chain* chain);
 
 /**
- * @brief Retrieve a block tree entry by its height in the currently active chain.
- * Once retrieved there is no guarantee that it remains in the active chain.
+ * @brief Return the block header of the block at the given height in the chain.
  *
- * @param[in] chain        Non-null.
- * @param[in] block_height Height in the chain of the to be retrieved block tree entry.
- * @return                 The block tree entry at a certain height in the currently active chain, or null
- *                         if the height is out of bounds.
+ * @param[in] chain        The chain, or null for the empty chain.
+ * @param[in] block_height Height of the block in the chain.
+ * @return                 The block header at the given height, or null if the height is out of bounds.
  */
-BITCOINKERNEL_API const btck_BlockTreeEntry* btck_chain_get_by_height(
+BITCOINKERNEL_API btck_BlockHeader* BITCOINKERNEL_WARN_UNUSED_RESULT btck_chain_get_block_header(
     const btck_Chain* chain,
-    int32_t block_height) BITCOINKERNEL_ARG_NONNULL(1);
+    int32_t block_height);
 
 /**
- * @brief Return true if the passed in chain contains the block tree entry.
+ * @brief Return the block hash of the block at the given height in the chain.
+ * The returned hash is owned by the chain and must not be destroyed by the caller.
  *
- * @param[in] chain            Non-null.
- * @param[in] block_tree_entry Non-null.
- * @return                     1 if the block_tree_entry is in the chain, 0 otherwise.
- *
+ * @param[in] chain        The chain, or null for the empty chain.
+ * @param[in] block_height Height of the block in the chain.
+ * @return                 The block hash at the given height, or null if the height is out of bounds.
  */
-BITCOINKERNEL_API int btck_chain_contains(
+BITCOINKERNEL_API const btck_BlockHash* btck_chain_get_block_hash(
     const btck_Chain* chain,
-    const btck_BlockTreeEntry* block_tree_entry) BITCOINKERNEL_ARG_NONNULL(1, 2);
+    int32_t block_height);
+
+/**
+ * @brief Return the sub-chain ending at the given height, i.e. the prefix of
+ * the chain from the genesis block up to and including the block at that
+ * height.
+ *
+ * @param[in] chain        The chain, or null for the empty chain.
+ * @param[in] block_height Height of the block the returned chain ends at.
+ * @return                 The sub-chain ending at the given height, or the empty chain (null) if the height is out of bounds.
+ */
+BITCOINKERNEL_API const btck_Chain* btck_chain_get_ancestor(
+    const btck_Chain* chain,
+    int32_t block_height);
+
+/**
+ * @brief Return the parent chain: the prefix of this chain with its tip
+ * removed, i.e. the chain ending at the block one lower.
+ *
+ * @param[in] chain The chain, or null for the empty chain.
+ * @return          The parent chain, or the empty chain (null) if the chain consists of only the genesis block.
+ */
+BITCOINKERNEL_API const btck_Chain* btck_chain_get_parent(
+    const btck_Chain* chain);
+
+/**
+ * @brief Return whether the chain starts with the given prefix, i.e. whether
+ * every block of the prefix chain is also a block of the chain at the same
+ * height. Equivalently, this tests whether the tip of the prefix chain is part
+ * of the chain.
+ *
+ * @param[in] chain  The chain, or null for the empty chain.
+ * @param[in] prefix The prefix chain, or null for the empty chain (which is a prefix of every chain).
+ * @return           1 if the chain starts with the prefix, 0 otherwise.
+ */
+BITCOINKERNEL_API int btck_chain_starts_with(
+    const btck_Chain* chain,
+    const btck_Chain* prefix);
+
+/**
+ * @brief Return the fork point of two chains: the longest common prefix
+ * beginning at the genesis block, i.e. the sub-chain ending at the last block
+ * both chains have in common.
+ *
+ * @param[in] chain1 The chain, or null for the empty chain.
+ * @param[in] chain2 The chain, or null for the empty chain.
+ * @return           The fork point of the two chains, or the empty chain (null) if they share no block.
+ */
+BITCOINKERNEL_API const btck_Chain* btck_chain_find_fork(
+    const btck_Chain* chain1,
+    const btck_Chain* chain2);
+
+/**
+ * @brief Check if two chains are equal. Two chains are equal when they end at
+ * the same block (two empty chains are equal).
+ *
+ * @param[in] chain1 The chain, or null for the empty chain.
+ * @param[in] chain2 The chain, or null for the empty chain.
+ * @return           1 if the chains are equal, 0 otherwise.
+ */
+BITCOINKERNEL_API int btck_chain_equals(
+    const btck_Chain* chain1,
+    const btck_Chain* chain2);
 
 ///@}
 
@@ -1551,16 +1542,17 @@ BITCOINKERNEL_API int btck_chain_contains(
 ///@{
 
 /**
- * @brief Reads the block spent coins data the passed in block tree entry points to from
- * disk and returns it.
+ * @brief Reads the block spent coins data of the block at the tip of the
+ * passed in chain from disk and returns it.
  *
  * @param[in] chainstate_manager Non-null.
- * @param[in] block_tree_entry   Non-null.
+ * @param[in] chain              The chain whose tip block to read; the empty chain (null) has no
+ *                               tip and yields null.
  * @return                       The read out block spent outputs, or null on error.
  */
 BITCOINKERNEL_API btck_BlockSpentOutputs* BITCOINKERNEL_WARN_UNUSED_RESULT btck_block_spent_outputs_read(
     const btck_ChainstateManager* chainstate_manager,
-    const btck_BlockTreeEntry* block_tree_entry) BITCOINKERNEL_ARG_NONNULL(1, 2);
+    const btck_Chain* chain) BITCOINKERNEL_ARG_NONNULL(1);
 
 /**
  * @brief Copy a block's spent outputs.
