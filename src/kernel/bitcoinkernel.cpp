@@ -146,10 +146,10 @@ struct Handle {
 
 } // namespace
 
-struct btck_BlockTreeEntry: Handle<btck_BlockTreeEntry, CBlockIndex> {};
 struct btck_Block : Handle<btck_Block, std::shared_ptr<const CBlock>> {};
 struct btck_BlockValidationState : Handle<btck_BlockValidationState, BlockValidationState> {};
 struct btck_TxValidationState : Handle<btck_TxValidationState, TxValidationState> {};
+struct btck_Chain : Handle<btck_Chain, CBlockIndex> {};
 
 namespace {
 
@@ -303,7 +303,7 @@ public:
 
     kernel::InterruptResult blockTip(SynchronizationState state, const CBlockIndex& index, double verification_progress) override
     {
-        if (m_cbs.block_tip) m_cbs.block_tip(m_cbs.user_data, cast_state(state), btck_BlockTreeEntry::ref(&index), verification_progress);
+        if (m_cbs.block_tip) m_cbs.block_tip(m_cbs.user_data, cast_state(state), btck_Chain::ref(&index), verification_progress);
         return {};
     }
     void headerTip(SynchronizationState state, int64_t height, int64_t timestamp, bool presync) override
@@ -363,7 +363,7 @@ protected:
         if (m_cbs.pow_valid_block) {
             m_cbs.pow_valid_block(m_cbs.user_data,
                                   btck_Block::copy(btck_Block::ref(&block)),
-                                  btck_BlockTreeEntry::ref(pindex));
+                                  btck_Chain::ref(pindex));
         }
     }
 
@@ -372,7 +372,7 @@ protected:
         if (m_cbs.block_connected) {
             m_cbs.block_connected(m_cbs.user_data,
                                   btck_Block::copy(btck_Block::ref(&block)),
-                                  btck_BlockTreeEntry::ref(pindex));
+                                  btck_Chain::ref(pindex));
         }
     }
 
@@ -381,7 +381,7 @@ protected:
         if (m_cbs.block_disconnected) {
             m_cbs.block_disconnected(m_cbs.user_data,
                                      btck_Block::copy(btck_Block::ref(&block)),
-                                     btck_BlockTreeEntry::ref(pindex));
+                                     btck_Chain::ref(pindex));
         }
     }
 };
@@ -494,7 +494,6 @@ struct btck_Context : Handle<btck_Context, std::shared_ptr<const Context>> {};
 struct btck_ChainParameters : Handle<btck_ChainParameters, CChainParams> {};
 struct btck_ChainstateManagerOptions : Handle<btck_ChainstateManagerOptions, ChainstateManagerOptions> {};
 struct btck_ChainstateManager : Handle<btck_ChainstateManager, ChainMan> {};
-struct btck_Chain : Handle<btck_Chain, CChain> {};
 struct btck_BlockSpentOutputs : Handle<btck_BlockSpentOutputs, std::shared_ptr<CBlockUndo>> {};
 struct btck_TransactionSpentOutputs : Handle<btck_TransactionSpentOutputs, CTxUndo> {};
 struct btck_Coin : Handle<btck_Coin, Coin> {};
@@ -895,23 +894,6 @@ void btck_context_destroy(btck_Context* context)
     delete context;
 }
 
-const btck_BlockTreeEntry* btck_block_tree_entry_get_previous(const btck_BlockTreeEntry* entry)
-{
-    if (!btck_BlockTreeEntry::get(entry).pprev) {
-        LogInfo("Genesis block has no previous.");
-        return nullptr;
-    }
-
-    return btck_BlockTreeEntry::ref(btck_BlockTreeEntry::get(entry).pprev);
-}
-
-const btck_BlockTreeEntry* btck_block_tree_entry_get_ancestor(const btck_BlockTreeEntry* block_tree_entry, int32_t height)
-{
-    const auto* ancestor{btck_BlockTreeEntry::get(block_tree_entry).GetAncestor(height)};
-    assert(ancestor);
-    return btck_BlockTreeEntry::ref(ancestor);
-}
-
 btck_BlockValidationState* btck_block_validation_state_create()
 {
     return btck_BlockValidationState::create();
@@ -1062,7 +1044,7 @@ btck_ChainstateManager* btck_chainstate_manager_create(
     return btck_ChainstateManager::create(std::move(chainman), opts.m_context);
 }
 
-const btck_BlockTreeEntry* btck_chainstate_manager_get_block_tree_entry_by_hash(const btck_ChainstateManager* chainman, const btck_BlockHash* block_hash)
+const btck_Chain* btck_chainstate_manager_find(const btck_ChainstateManager* chainman, const btck_BlockHash* block_hash)
 {
     auto block_index = WITH_LOCK(btck_ChainstateManager::get(chainman).m_chainman->GetMutex(),
                                  return btck_ChainstateManager::get(chainman).m_chainman->m_blockman.LookupBlockIndex(btck_BlockHash::get(block_hash)));
@@ -1070,13 +1052,13 @@ const btck_BlockTreeEntry* btck_chainstate_manager_get_block_tree_entry_by_hash(
         LogDebug(BCLog::KERNEL, "A block with the given hash is not indexed.");
         return nullptr;
     }
-    return btck_BlockTreeEntry::ref(block_index);
+    return btck_Chain::ref(block_index);
 }
 
-const btck_BlockTreeEntry* btck_chainstate_manager_get_best_entry(const btck_ChainstateManager* chainstate_manager)
+const btck_Chain* btck_chainstate_manager_get_best_chain(const btck_ChainstateManager* chainstate_manager)
 {
     auto& chainman = *btck_ChainstateManager::get(chainstate_manager).m_chainman;
-    return btck_BlockTreeEntry::ref(WITH_LOCK(chainman.GetMutex(), return chainman.m_best_header));
+    return btck_Chain::ref(WITH_LOCK(chainman.GetMutex(), return chainman.m_best_header));
 }
 
 void btck_chainstate_manager_destroy(btck_ChainstateManager* chainman)
@@ -1186,34 +1168,18 @@ void btck_block_destroy(btck_Block* block)
     delete block;
 }
 
-btck_Block* btck_block_read(const btck_ChainstateManager* chainman, const btck_BlockTreeEntry* entry)
+btck_Block* btck_block_read(const btck_ChainstateManager* chainman, const btck_Chain* chain)
 {
+    if (!chain) {
+        LogDebug(BCLog::KERNEL, "The empty chain has no tip block to read.");
+        return nullptr;
+    }
     auto block{std::make_shared<CBlock>()};
-    if (!btck_ChainstateManager::get(chainman).m_chainman->m_blockman.ReadBlock(*block, btck_BlockTreeEntry::get(entry))) {
+    if (!btck_ChainstateManager::get(chainman).m_chainman->m_blockman.ReadBlock(*block, btck_Chain::get(chain))) {
         LogError("Failed to read block.");
         return nullptr;
     }
     return btck_Block::create(block);
-}
-
-btck_BlockHeader* btck_block_tree_entry_get_block_header(const btck_BlockTreeEntry* entry)
-{
-    return btck_BlockHeader::create(btck_BlockTreeEntry::get(entry).GetBlockHeader());
-}
-
-int32_t btck_block_tree_entry_get_height(const btck_BlockTreeEntry* entry)
-{
-    return btck_BlockTreeEntry::get(entry).nHeight;
-}
-
-const btck_BlockHash* btck_block_tree_entry_get_block_hash(const btck_BlockTreeEntry* entry)
-{
-    return btck_BlockHash::ref(btck_BlockTreeEntry::get(entry).phashBlock);
-}
-
-int btck_block_tree_entry_equals(const btck_BlockTreeEntry* entry1, const btck_BlockTreeEntry* entry2)
-{
-    return &btck_BlockTreeEntry::get(entry1) == &btck_BlockTreeEntry::get(entry2);
 }
 
 btck_BlockHash* btck_block_hash_create(const unsigned char block_hash[32])
@@ -1241,14 +1207,18 @@ void btck_block_hash_destroy(btck_BlockHash* hash)
     delete hash;
 }
 
-btck_BlockSpentOutputs* btck_block_spent_outputs_read(const btck_ChainstateManager* chainman, const btck_BlockTreeEntry* entry)
+btck_BlockSpentOutputs* btck_block_spent_outputs_read(const btck_ChainstateManager* chainman, const btck_Chain* chain)
 {
+    if (!chain) {
+        LogDebug(BCLog::KERNEL, "The empty chain has no tip block to read spent outputs for.");
+        return nullptr;
+    }
     auto block_undo{std::make_shared<CBlockUndo>()};
-    if (btck_BlockTreeEntry::get(entry).nHeight < 1) {
+    if (btck_Chain::get(chain).nHeight == 0) {
         LogDebug(BCLog::KERNEL, "The genesis block does not have any spent outputs.");
         return btck_BlockSpentOutputs::create(block_undo);
     }
-    if (!btck_ChainstateManager::get(chainman).m_chainman->m_blockman.ReadBlockUndo(*block_undo, btck_BlockTreeEntry::get(entry))) {
+    if (!btck_ChainstateManager::get(chainman).m_chainman->m_blockman.ReadBlockUndo(*block_undo, btck_Chain::get(chain))) {
         LogError("Failed to read block spent outputs data.");
         return nullptr;
     }
@@ -1355,25 +1325,83 @@ btck_BlockValidationState* btck_chainstate_manager_process_block_header(
 
 const btck_Chain* btck_chainstate_manager_get_active_chain(const btck_ChainstateManager* chainman)
 {
-    return btck_Chain::ref(&WITH_LOCK(btck_ChainstateManager::get(chainman).m_chainman->GetMutex(), return btck_ChainstateManager::get(chainman).m_chainman->ActiveChain()));
+    return btck_Chain::ref(WITH_LOCK(btck_ChainstateManager::get(chainman).m_chainman->GetMutex(), return btck_ChainstateManager::get(chainman).m_chainman->ActiveChain().Tip()));
 }
 
 int32_t btck_chain_get_height(const btck_Chain* chain)
 {
-    LOCK(::cs_main);
-    return btck_Chain::get(chain).Height();
+    // A null chain is the empty chain, which has no blocks and so a height of -1.
+    return chain ? btck_Chain::get(chain).nHeight : -1;
 }
 
-const btck_BlockTreeEntry* btck_chain_get_by_height(const btck_Chain* chain, int32_t height)
+btck_BlockHeader* btck_chain_get_block_header(const btck_Chain* chain, int32_t height)
 {
-    LOCK(::cs_main);
-    return btck_BlockTreeEntry::ref(btck_Chain::get(chain)[height]);
+    const auto* index{chain ? btck_Chain::get(chain).GetAncestor(height) : nullptr};
+    if (!index) {
+        LogDebug(BCLog::KERNEL, "The requested height is not in the chain.");
+        return nullptr;
+    }
+    return btck_BlockHeader::create(index->GetBlockHeader());
 }
 
-int btck_chain_contains(const btck_Chain* chain, const btck_BlockTreeEntry* entry)
+const btck_BlockHash* btck_chain_get_block_hash(const btck_Chain* chain, int32_t height)
 {
-    LOCK(::cs_main);
-    return btck_Chain::get(chain).Contains(btck_BlockTreeEntry::get(entry)) ? 1 : 0;
+    const auto* index{chain ? btck_Chain::get(chain).GetAncestor(height) : nullptr};
+    if (!index) {
+        LogDebug(BCLog::KERNEL, "The requested height is not in the chain.");
+        return nullptr;
+    }
+    return btck_BlockHash::ref(index->phashBlock);
+}
+
+const btck_Chain* btck_chain_get_ancestor(const btck_Chain* chain, int32_t height)
+{
+    const auto* ancestor{chain ? btck_Chain::get(chain).GetAncestor(height) : nullptr};
+    if (!ancestor) {
+        LogDebug(BCLog::KERNEL, "The requested height is not in the chain.");
+        return nullptr;
+    }
+    return btck_Chain::ref(ancestor);
+}
+
+const btck_Chain* btck_chain_get_parent(const btck_Chain* chain)
+{
+    // The parent of the empty chain, and of the genesis-only chain, is the empty
+    // chain.
+    const auto* pprev{chain ? btck_Chain::get(chain).pprev : nullptr};
+    if (!pprev) {
+        return nullptr;
+    }
+    return btck_Chain::ref(pprev);
+}
+
+int btck_chain_starts_with(const btck_Chain* chain, const btck_Chain* prefix)
+{
+    // The empty chain is a prefix of every chain; a non-empty prefix cannot be a
+    // prefix of the empty chain.
+    if (!prefix) return 1;
+    if (!chain) return 0;
+    const auto& tip{btck_Chain::get(chain)};
+    const auto& prefix_tip{btck_Chain::get(prefix)};
+    return tip.GetAncestor(prefix_tip.nHeight) == &prefix_tip ? 1 : 0;
+}
+
+const btck_Chain* btck_chain_find_fork(const btck_Chain* chain1, const btck_Chain* chain2)
+{
+    // The empty chain shares no block with any chain, so the fork is empty.
+    if (!chain1 || !chain2) return nullptr;
+    const auto* common{LastCommonAncestor(&btck_Chain::get(chain1), &btck_Chain::get(chain2))};
+    if (!common) {
+        return nullptr;
+    }
+    return btck_Chain::ref(common);
+}
+
+int btck_chain_equals(const btck_Chain* chain1, const btck_Chain* chain2)
+{
+    // Chains are identified by their tip, which a btck_Chain* aliases directly,
+    // so pointer equality is chain equality (and the empty chain equals itself).
+    return chain1 == chain2 ? 1 : 0;
 }
 
 btck_BlockHeader* btck_block_header_create(const void* raw_block_header, size_t raw_block_header_len)

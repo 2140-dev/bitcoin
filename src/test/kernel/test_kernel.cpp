@@ -13,6 +13,7 @@
 #include <test/util/common.h>
 
 #include <charconv>
+#include <concepts>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -200,17 +201,17 @@ public:
         }
     }
 
-    void BlockConnected(Block block, BlockTreeEntry entry) override
+    void BlockConnected(Block block, Chain chain) override
     {
         std::cout << "Block connected." << std::endl;
     }
 
-    void PowValidBlock(BlockTreeEntry entry, Block block) override
+    void PowValidBlock(Chain chain, Block block) override
     {
         std::cout << "Block passed pow verification" << std::endl;
     }
 
-    void BlockDisconnected(Block block, BlockTreeEntry entry) override
+    void BlockDisconnected(Block block, Chain chain) override
     {
         std::cout << "Block disconnected." << std::endl;
     }
@@ -822,33 +823,33 @@ void chainman_reindex_test(TestDirectory& test_directory)
 
     // Sanity check some block retrievals
     auto chain{chainman->GetChain()};
-    BOOST_CHECK_THROW(chain.GetByHeight(1000), std::runtime_error);
-    auto genesis_index{chain.Entries().front()};
-    BOOST_CHECK(!genesis_index.GetPrevious());
-    auto genesis_block_raw{chainman->ReadBlock(genesis_index).value().ToBytes()};
-    auto first_index{chain.GetByHeight(0)};
-    auto first_block_raw{chainman->ReadBlock(genesis_index).value().ToBytes()};
+    BOOST_CHECK(!chain.GetAncestor(1000)); // out-of-range ancestor is the empty chain
+    auto genesis{chain.GetAncestor(0)};
+    BOOST_CHECK_EQUAL(genesis.Height(), 0);
+    auto genesis_block_raw{chainman->ReadBlock(genesis).value().ToBytes()};
+    auto first{chain.GetAncestor(0)};
+    auto first_block_raw{chainman->ReadBlock(genesis).value().ToBytes()};
     check_equal(genesis_block_raw, first_block_raw);
-    auto height{first_index.GetHeight()};
+    auto height{first.Height()};
     BOOST_CHECK_EQUAL(height, 0);
 
-    auto next_index{chain.GetByHeight(first_index.GetHeight() + 1)};
-    BOOST_CHECK(chain.Contains(next_index));
-    auto next_block_data{chainman->ReadBlock(next_index).value().ToBytes()};
-    auto tip_index{chain.Entries().back()};
-    auto tip_block_data{chainman->ReadBlock(tip_index).value().ToBytes()};
-    auto second_index{chain.GetByHeight(1)};
-    auto second_block{chainman->ReadBlock(second_index).value()};
+    auto next{chain.GetAncestor(first.Height() + 1)};
+    BOOST_CHECK(chain.StartsWith(next));
+    auto next_block_data{chainman->ReadBlock(next).value().ToBytes()};
+    auto tip{chain.GetAncestor(chain.Height())};
+    auto tip_block_data{chainman->ReadBlock(tip).value().ToBytes()};
+    auto second{chain.GetAncestor(1)};
+    auto second_block{chainman->ReadBlock(second).value()};
     auto second_block_data{second_block.ToBytes()};
-    auto second_height{second_index.GetHeight()};
+    auto second_height{second.Height()};
     BOOST_CHECK_EQUAL(second_height, 1);
     check_equal(next_block_data, tip_block_data);
     check_equal(next_block_data, second_block_data);
 
-    auto second_hash{second_index.GetHash()};
-    auto another_second_index{chainman->GetBlockTreeEntry(second_hash)};
-    BOOST_CHECK(another_second_index);
-    auto another_second_height{another_second_index->GetHeight()};
+    auto second_hash{second.TipHash()};
+    auto another_second{chainman->Find(second_hash)};
+    BOOST_CHECK(another_second); // found: non-empty chain
+    auto another_second_height{another_second.Height()};
     auto second_block_hash{second_block.GetHash()};
     check_equal(second_block_hash.ToBytes(), second_hash.ToBytes());
     BOOST_CHECK_EQUAL(second_height, another_second_height);
@@ -912,19 +913,20 @@ void chainman_mainnet_validation_test(TestDirectory& test_directory)
 
     auto chain{chainman->GetChain()};
     BOOST_CHECK_EQUAL(chain.Height(), 1);
-    auto tip{chain.Entries().back()};
+    auto tip{chain.GetAncestor(chain.Height())};
     auto read_block{chainman->ReadBlock(tip)};
     BOOST_REQUIRE(read_block);
     check_equal(read_block.value().ToBytes(), raw_block);
 
     // Check that we can read the previous block
-    BlockTreeEntry tip_2{*tip.GetPrevious()};
+    Chain tip_2{tip.Parent()};
     Block read_block_2{*chainman->ReadBlock(tip_2)};
     BOOST_CHECK_EQUAL(chainman->ReadBlockSpentOutputs(tip_2).Count(), 0);
     BOOST_CHECK_EQUAL(chainman->ReadBlockSpentOutputs(tip).Count(), 0);
 
-    // It should be an error if we go another block back, since the genesis has no ancestor
-    BOOST_CHECK(!tip_2.GetPrevious());
+    // The genesis block has no parent
+    BOOST_CHECK_EQUAL(tip_2.Height(), 0);
+    BOOST_CHECK(!tip_2.Parent());
 
     // If we try to validate it again, it should be a duplicate
     BOOST_CHECK(chainman->ProcessBlock(block, &new_block));
@@ -1013,9 +1015,9 @@ BOOST_AUTO_TEST_CASE(btck_block_hash_tests)
     CheckHandle(block_hash, block_hash_2);
 }
 
-BOOST_AUTO_TEST_CASE(btck_block_tree_entry_tests)
+BOOST_AUTO_TEST_CASE(btck_chain_tests)
 {
-    auto test_directory{TestDirectory{"block_tree_entry_test_bitcoin_kernel"}};
+    auto test_directory{TestDirectory{"chain_test_bitcoin_kernel"}};
     auto notifications{std::make_shared<TestKernelNotifications>()};
     auto context{create_context(notifications, ChainType::REGTEST)};
     auto chainman{create_chainman(
@@ -1035,29 +1037,151 @@ BOOST_AUTO_TEST_CASE(btck_block_tree_entry_tests)
     }
 
     auto chain{chainman->GetChain()};
-    auto entry_0{chain.GetByHeight(0)};
-    auto entry_1{chain.GetByHeight(1)};
-    auto entry_2{chain.GetByHeight(2)};
+    auto entry_0{chain.GetAncestor(0)};
+    auto entry_1{chain.GetAncestor(1)};
+    auto entry_2{chain.GetAncestor(2)};
 
     // Test inequality
     BOOST_CHECK(entry_0 != entry_1);
     BOOST_CHECK(entry_1 != entry_2);
     BOOST_CHECK(entry_0 != entry_2);
 
-    // Test equality with same entry
-    BOOST_CHECK(entry_0 == chain.GetByHeight(0));
-    BOOST_CHECK(entry_0 == BlockTreeEntry{entry_0});
+    // Test equality with the same chain
+    BOOST_CHECK(entry_0 == chain.GetAncestor(0));
+    BOOST_CHECK(entry_0 == Chain{entry_0});
     BOOST_CHECK(entry_1 == entry_1);
 
-    // Test GetPrevious
-    auto prev{entry_1.GetPrevious()};
-    BOOST_CHECK(prev.has_value());
-    BOOST_CHECK(prev.value() == entry_0);
+    // Test the previous block via the O(1) parent chain
+    auto prev{entry_1.Parent()};
+    BOOST_CHECK(prev); // non-empty: entry_1 has a parent
+    BOOST_CHECK(prev == entry_0);
+    BOOST_CHECK(!entry_0.Parent()); // genesis: parent is the empty chain
 
     // Test GetAncestor
     BOOST_CHECK(entry_2.GetAncestor(2) == entry_2);
     BOOST_CHECK(entry_2.GetAncestor(1) == entry_1);
     BOOST_CHECK(entry_2.GetAncestor(0) == entry_0);
+
+    // Test StartsWith
+    BOOST_CHECK(entry_2.StartsWith(entry_1));
+    BOOST_CHECK(entry_2.StartsWith(entry_0));
+    BOOST_CHECK(!entry_0.StartsWith(entry_2));
+
+    // Test FindFork (the common prefix / fork point)
+    BOOST_CHECK(entry_2.FindFork(entry_1) == entry_1);
+    BOOST_CHECK(entry_0.FindFork(entry_2) == entry_0);
+
+    // Test Mismatch (the first differing block on each side, returning iterators
+    // just like std::ranges::mismatch over the chains' entries).
+    // entry_2 vs entry_1: equal up to height 1; entry_2 diverges with its
+    // height-2 block, entry_1 is exhausted (a prefix, so its side is end()).
+    auto mm{entry_2.Mismatch(entry_1)};
+    BOOST_CHECK(mm.in1 != entry_2.end());
+    BOOST_CHECK(*mm.in1 == entry_2.TipHeader()); // header of entry_2's diverging block
+    BOOST_CHECK(mm.in2 == entry_1.end());
+
+    // entry_0 vs entry_2: entry_0 (genesis only) is exhausted at the fork (end());
+    // entry_2 diverges with its height-1 block.
+    auto mm2{entry_0.Mismatch(entry_2)};
+    BOOST_CHECK(mm2.in1 == entry_0.end());
+    BOOST_CHECK(mm2.in2 != entry_2.end());
+    BOOST_CHECK(*mm2.in2 == entry_1.TipHeader()); // header at entry_2's height-1 block
+
+    // Two identical chains have no divergence: both sides reach end().
+    auto mm3{entry_2.Mismatch(entry_2)};
+    BOOST_CHECK(mm3.in1 == entry_2.end());
+    BOOST_CHECK(mm3.in2 == entry_2.end());
+}
+
+BOOST_AUTO_TEST_CASE(btck_chain_empty_tests)
+{
+    auto test_directory{TestDirectory{"chain_empty_test_bitcoin_kernel"}};
+    auto notifications{std::make_shared<TestKernelNotifications>()};
+    auto context{create_context(notifications, ChainType::REGTEST)};
+    auto chainman{create_chainman(
+        test_directory,
+        /*reindex=*/false,
+        /*wipe_chainstate=*/false,
+        /*block_tree_db_in_memory=*/true,
+        /*chainstate_db_in_memory=*/true,
+        context)};
+
+    for (size_t i{0}; i < 3; i++) {
+        Block block{hex_string_to_byte_vec(REGTEST_BLOCK_DATA[i])};
+        bool new_block{false};
+        chainman->ProcessBlock(block, &new_block);
+        BOOST_CHECK(new_block);
+    }
+
+    auto chain{chainman->GetChain()};
+    auto genesis{chain.GetAncestor(0)};
+
+    // Find with a hash that is not in the block index yields the empty chain,
+    // observable through operator bool() / empty() rather than std::optional.
+    BlockHash unknown{std::array<std::byte, 32>{}};
+    auto empty{chainman->Find(unknown)};
+    BOOST_CHECK(!empty);
+    BOOST_CHECK(empty.empty());
+    BOOST_CHECK_EQUAL(empty.size(), 0u);
+    BOOST_CHECK_EQUAL(empty.Height(), -1);
+    BOOST_CHECK(empty.begin() == empty.end());
+
+    // A real chain is non-empty.
+    BOOST_CHECK(chain);
+    BOOST_CHECK(!chain.empty());
+
+    // Navigating off the ends of a chain produces the empty chain.
+    BOOST_CHECK(!genesis.Parent());          // genesis has no parent
+    BOOST_CHECK(!chain.GetAncestor(1000));   // height out of range
+    BOOST_CHECK(!chain.GetAncestor(-1));     // height out of range
+
+    // The empty chain navigates to itself and equals other empty chains.
+    BOOST_CHECK(empty == genesis.Parent());
+    BOOST_CHECK(!empty.Parent());
+    BOOST_CHECK(!empty.GetAncestor(0));
+
+    // StartsWith: the empty chain is a prefix of every chain (including itself),
+    // but no non-empty chain is a prefix of the empty chain.
+    BOOST_CHECK(chain.StartsWith(empty));
+    BOOST_CHECK(empty.StartsWith(empty));
+    BOOST_CHECK(!empty.StartsWith(chain));
+
+    // The empty chain has no tip block to read.
+    BOOST_CHECK(!chainman->ReadBlock(empty));
+}
+
+BOOST_AUTO_TEST_CASE(btck_chain_mismatch_matches_std_ranges)
+{
+    auto test_directory{TestDirectory{"chain_mismatch_test_bitcoin_kernel"}};
+    auto notifications{std::make_shared<TestKernelNotifications>()};
+    auto context{create_context(notifications, ChainType::REGTEST)};
+    auto chainman{create_chainman(
+        test_directory,
+        /*reindex=*/false,
+        /*wipe_chainstate=*/false,
+        /*block_tree_db_in_memory=*/true,
+        /*chainstate_db_in_memory=*/true,
+        context)};
+
+    for (size_t i{0}; i < 3; i++) {
+        Block block{hex_string_to_byte_vec(REGTEST_BLOCK_DATA[i])};
+        bool new_block{false};
+        chainman->ProcessBlock(block, &new_block);
+        BOOST_CHECK(new_block);
+    }
+
+    auto chain{chainman->GetChain()};
+    auto chain1{chain.GetAncestor(2)};
+    auto chain2{chain.GetAncestor(1)};
+
+    // The member Chain::Mismatch is exactly std::ranges::mismatch run over
+    // the two chains (which are random-access ranges of their block headers):
+    // same result type, same iterators.
+    auto res1 = chain1.Mismatch(chain2);
+    auto res2 = std::ranges::mismatch(chain1, chain2);
+    static_assert(std::same_as<decltype(res1), decltype(res2)>);
+    BOOST_CHECK(res1.in1 == res2.in1);
+    BOOST_CHECK(res1.in2 == res2.in2);
 }
 
 BOOST_AUTO_TEST_CASE(btck_chainman_in_memory_tests)
@@ -1101,11 +1225,11 @@ BOOST_AUTO_TEST_CASE(btck_chainman_regtest_tests)
             BlockValidationState state = chainman->ProcessBlockHeader(header);
             BOOST_CHECK(state.GetValidationMode() == ValidationMode::VALID);
             BOOST_CHECK(state.GetBlockValidationResult() == BlockValidationResult::UNSET);
-            BlockTreeEntry entry{*chainman->GetBlockTreeEntry(header.Hash())};
-            BOOST_CHECK(!chainman->GetChain().Contains(entry));
-            BlockTreeEntry best_entry{chainman->GetBestEntry()};
-            BlockHash hash{entry.GetHash()};
-            BOOST_CHECK(hash == best_entry.GetHeader().Hash());
+            Chain found{chainman->Find(header.Hash())};
+            BOOST_CHECK(!chainman->GetChain().StartsWith(found));
+            Chain best{chainman->GetBestChain()};
+            BlockHash hash{found.TipHash()};
+            BOOST_CHECK(hash == best.TipHeader().Hash());
         }
     }
 
@@ -1138,11 +1262,11 @@ BOOST_AUTO_TEST_CASE(btck_chainman_regtest_tests)
     }
 
     auto chain = chainman->GetChain();
-    auto tip = chain.Entries().back();
+    auto tip = chain.GetAncestor(chain.Height());
     auto read_block = chainman->ReadBlock(tip).value();
     check_equal(read_block.ToBytes(), hex_string_to_byte_vec(REGTEST_BLOCK_DATA[REGTEST_BLOCK_DATA.size() - 1]));
 
-    auto tip_2 = tip.GetPrevious().value();
+    auto tip_2 = tip.Parent();
     auto read_block_2 = chainman->ReadBlock(tip_2).value();
     check_equal(read_block_2.ToBytes(), hex_string_to_byte_vec(REGTEST_BLOCK_DATA[REGTEST_BLOCK_DATA.size() - 2]));
 
@@ -1154,8 +1278,8 @@ BOOST_AUTO_TEST_CASE(btck_chainman_regtest_tests)
 
     auto find_transaction = [&chainman](const TxidView& target_txid) -> std::optional<Transaction> {
         auto chain = chainman->GetChain();
-        for (const auto block_tree_entry : chain.Entries()) {
-            auto block{chainman->ReadBlock(block_tree_entry)};
+        for (int32_t height = 0; height <= chain.Height(); ++height) {
+            auto block{chainman->ReadBlock(chain.GetAncestor(height))};
             for (const TransactionView transaction : block->Transactions()) {
                 if (transaction.Txid() == target_txid) {
                     return Transaction{transaction};
@@ -1165,8 +1289,8 @@ BOOST_AUTO_TEST_CASE(btck_chainman_regtest_tests)
         return std::nullopt;
     };
 
-    for (const auto block_tree_entry : chain.Entries()) {
-        auto block{chainman->ReadBlock(block_tree_entry)};
+    for (int32_t height = 0; height <= chain.Height(); ++height) {
+        auto block{chainman->ReadBlock(chain.GetAncestor(height))};
         for (const auto transaction : block->Transactions()) {
             std::vector<TransactionInput> inputs;
             std::vector<TransactionOutput> spent_outputs;
@@ -1193,7 +1317,7 @@ BOOST_AUTO_TEST_CASE(btck_chainman_regtest_tests)
 
     // Read spent outputs for current tip and its previous block
     BlockSpentOutputs block_spent_outputs{chainman->ReadBlockSpentOutputs(tip)};
-    BlockSpentOutputs block_spent_outputs_prev{chainman->ReadBlockSpentOutputs(*tip.GetPrevious())};
+    BlockSpentOutputs block_spent_outputs_prev{chainman->ReadBlockSpentOutputs(tip.Parent())};
     CheckHandle(block_spent_outputs, block_spent_outputs_prev);
     CheckRange(block_spent_outputs_prev.TxsSpentOutputs(), block_spent_outputs_prev.Count());
     BOOST_CHECK_EQUAL(block_spent_outputs.Count(), 1);
@@ -1231,10 +1355,8 @@ BOOST_AUTO_TEST_CASE(btck_chainman_regtest_tests)
         }
     }
 
-    CheckRange(chain.Entries(), chain.CountEntries());
-
-    for (const BlockTreeEntry entry : chain.Entries()) {
-        std::optional<Block> block{chainman->ReadBlock(entry)};
+    for (int32_t height = 0; height <= chain.Height(); ++height) {
+        std::optional<Block> block{chainman->ReadBlock(chain.GetAncestor(height))};
         if (block) {
             for (const TransactionView transaction : block->Transactions()) {
                 for (const TransactionOutputView output : transaction.Outputs()) {
@@ -1248,9 +1370,11 @@ BOOST_AUTO_TEST_CASE(btck_chainman_regtest_tests)
         }
     }
 
+    // Iterating the chain yields its block headers in order; the header at each
+    // position matches the tip header of the sub-chain ending at that height.
     int32_t count{0};
-    for (const auto entry : chain.Entries()) {
-        BOOST_CHECK_EQUAL(entry.GetHeight(), count);
+    for (const auto header : chain) {
+        BOOST_CHECK(header == chain.GetAncestor(count).TipHeader());
         ++count;
     }
     BOOST_CHECK_EQUAL(count, chain.CountEntries());
