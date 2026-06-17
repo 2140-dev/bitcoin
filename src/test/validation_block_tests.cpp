@@ -206,7 +206,7 @@ FIXTURE_TEST_CASE(processnewblock_signals_ordering, MinerTestingSetup)
             for (const auto& block : blocks) {
                 if (block->vtx.size() == 1) {
                     bool processed = ProcessNewBlock(*Assert(m_node.chainman), block, true, true, &ignored);
-                    assert(processed);
+                    CHECK(processed);
                 }
             }
         });
@@ -322,12 +322,16 @@ FIXTURE_TEST_CASE(mempool_locks_reorg, MinerTestingSetup)
                 // be atomic. So the caller assumes that the returned mempool
                 // is consistent. That is, it has all txs that were there
                 // before the reorg.
-                assert(m_node.mempool->size() == txs.size());
+                const auto mempool_size{m_node.mempool->size()};
+                if (mempool_size != txs.size()) {
+                    CHECK(mempool_size == txs.size());
+                    break;
+                }
                 continue;
             }
             LOCK(cs_main);
             // We are done with the reorg, so the tip must have changed
-            assert(tip_init != m_node.chainman->ActiveChain().Tip()->GetBlockHash());
+            CHECK(tip_init != m_node.chainman->ActiveChain().Tip()->GetBlockHash());
         }};
 
         // Submit the reorg in this thread to invalidate and remove the txs from the tx pool

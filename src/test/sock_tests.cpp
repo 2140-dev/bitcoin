@@ -10,7 +10,7 @@
 #include <util/threadinterrupt.h>
 
 #include <test/util/framework.hpp>
-#include <cassert>
+#include <stdexcept>
 #include <thread>
 
 using namespace std::chrono_literals;
@@ -163,15 +163,9 @@ FIXTURE_TEST_CASE(recv_until_terminator_limit, BasicTestingSetup)
 
     std::thread receiver([&socks, &timeout, &interrupt]() {
         constexpr size_t max_data{10};
-        bool threw_as_expected{false};
-        // CHECK_EXCEPTION() writes to some variables shared with the main thread which
-        // creates a data race. So mimic it manually.
-        try {
-            (void)socks.receiver.RecvUntilTerminator('\n', timeout, interrupt, max_data);
-        } catch (const std::runtime_error& e) {
-            threw_as_expected = HasReason("too many bytes without a terminator")(e);
-        }
-        assert(threw_as_expected);
+        CHECK_EXCEPTION((void)socks.receiver.RecvUntilTerminator('\n', timeout, interrupt, max_data),
+                        std::runtime_error,
+                        HasReason("too many bytes without a terminator"));
     });
 
     REQUIRE_NOTHROW(socks.sender.SendComplete("1234567", timeout, interrupt));
