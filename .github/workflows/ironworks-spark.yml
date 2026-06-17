@@ -2,17 +2,17 @@ name: Ironworks Spark
 
 on:
   pull_request:
+    branches:
+      - master
   push:
     branches:
-      - "**"
-    tags-ignore:
-      - "**"
+      - master
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
