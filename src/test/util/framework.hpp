@@ -6,16 +6,21 @@
 #include <tinyformat.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <ostream>
 #include <random>
 #include <ranges>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -50,23 +55,97 @@ struct Registrar {
     }
 };
 
-/** Name of the test currently running, in `suite::case` form. */
-inline std::string& current_test_full_name()
-{
-    static std::string s;
-    return s;
-}
-
-/** Single test metadata */
+/** Assertion counts for one test case. */
 struct TestStats {
     int checks = 0;
     int failed_checks = 0;
 };
 
-inline TestStats& current_stats()
+/** State and RAII registration for one running test case.
+ *
+ * Constructing a TestContext makes it the current test context until destruction.
+ * The runner is sequential: only one test case is active in a process.
+ * Non-aborting checks may be used from child threads that are joined before the
+ * test returns.
+ */
+class TestContext {
+public:
+    explicit TestContext(std::string name);
+    ~TestContext() noexcept;
+
+    TestContext(const TestContext&) = delete;
+    TestContext& operator=(const TestContext&) = delete;
+    TestContext(TestContext&&) = delete;
+    TestContext& operator=(TestContext&&) = delete;
+
+    const std::string& full_name() const noexcept { return m_full_name; }
+
+    bool on_owner_thread() const noexcept
+    {
+        return m_owner_thread == std::this_thread::get_id();
+    }
+
+    void record_check(bool failed) noexcept
+    {
+        m_checks.fetch_add(1, std::memory_order_relaxed);
+        if (failed) m_failed_checks.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    TestStats snapshot() const noexcept
+    {
+        return TestStats{
+            m_checks.load(std::memory_order_relaxed),
+            m_failed_checks.load(std::memory_order_relaxed),
+        };
+    }
+
+private:
+    const std::string m_full_name;
+    const std::thread::id m_owner_thread{std::this_thread::get_id()};
+    std::atomic<int> m_checks{0};
+    std::atomic<int> m_failed_checks{0};
+};
+
+/** Process-global locator used by assertion macros.
+ *
+ * TestContext owns the state. This pointer only lets CHECK/REQUIRE find the
+ * current context without exposing it to test writers or threading it through
+ * every helper signature.
+ */
+inline std::atomic<TestContext*>& current_test_context_storage()
 {
-    static TestStats stats;
-    return stats;
+    static std::atomic<TestContext*> context{nullptr};
+    return context;
+}
+
+inline TestContext::TestContext(std::string name) : m_full_name{std::move(name)}
+{
+    TestContext* expected{nullptr};
+    if (!current_test_context_storage().compare_exchange_strong(expected, this,
+                                                                std::memory_order_release,
+                                                                std::memory_order_relaxed)) {
+        throw std::logic_error{"test framework supports only one active test case per process"};
+    }
+}
+
+inline TestContext::~TestContext() noexcept
+{
+    auto* previous{current_test_context_storage().exchange(nullptr, std::memory_order_release)};
+    assert(previous == this);
+    (void)previous;
+}
+
+/** Current test context used by assertion macros and framework helpers. */
+inline TestContext& current_test_context()
+{
+    if (auto* context{current_test_context_storage().load(std::memory_order_acquire)}) return *context;
+    throw std::logic_error{"test framework assertion used outside an active test case"};
+}
+
+/** Name of the test currently running, in `suite/case` form. */
+inline std::string current_test_full_name()
+{
+    return current_test_context().full_name();
 }
 
 struct RunSummary {
@@ -89,11 +168,24 @@ inline LogLevel& current_log_level()
     return level;
 }
 
+inline std::mutex& log_mutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+template <typename... Args>
+inline void log_unlocked(const char* fmt, Args&&... args)
+{
+    tfm::vformat(std::cout, fmt, tfm::makeFormatList(std::forward<Args>(args)...));
+}
+
 template <typename... Args>
 inline void log(LogLevel level, const char* fmt, Args&&... args)
 {
     if (current_log_level() >= level) {
-        tfm::vformat(std::cout, fmt, tfm::makeFormatList(std::forward<Args>(args)...));
+        std::scoped_lock lock{log_mutex()};
+        log_unlocked(fmt, std::forward<Args>(args)...);
     }
 }
 
@@ -129,6 +221,7 @@ inline std::string stringify(const char* s)
     return s ? std::string("\"") + s + "\"" : std::string("nullptr");
 }
 
+/** Result of evaluating one assertion expression. */
 struct Result {
     std::optional<std::string> failed_expression;
 
@@ -191,7 +284,7 @@ struct CapturedExpression {
 #undef DECOMPOSE_OP
 };
 
-/** Decomposer overloads a high-precedence operator so the expression is captured before evalution. */
+/** Decomposer overloads a high-precedence operator so the expression is captured before evaluation. */
 struct Decomposer {
     template <typename T>
     CapturedExpression<T> operator<=(const T& lhs) const
@@ -213,19 +306,31 @@ inline std::optional<LogLevel> to_log_level(std::string_view s)
     return std::nullopt;
 }
 
-inline void record_check(const Result& result, const char* kind, const char* expr,
+inline void record_check(TestContext& context, const Result& result, const char* kind, const char* expr,
                          const char* file, int line, const std::string& message = {})
 {
-    auto& stats = current_stats();
-    ++stats.checks;
+    context.record_check(/*failed=*/!result.is_ok());
     if (!result.is_ok()) {
-        ++stats.failed_checks;
-        log(LogLevel::Error, "[FAIL]: %s:%d: %s(%s)\n", file, line, kind, expr);
-        log(LogLevel::Error, "%s\n", *result.failed_expression);
-        log(LogLevel::Error, "%s\n", message);
+        if (current_log_level() >= LogLevel::Error) {
+            std::scoped_lock lock{log_mutex()};
+            log_unlocked("[FAIL]: %s:%d: %s(%s)\n", file, line, kind, expr);
+            log_unlocked("%s\n", *result.failed_expression);
+            log_unlocked("%s\n", message);
+        }
         return;
     }
     log(LogLevel::All, "[PASS]: %s:%d: %s(%s)\n", file, line, kind, expr);
+}
+
+inline bool aborting_check_allowed(const char* kind, const char* file, int line)
+{
+    auto& context = current_test_context();
+    if (context.on_owner_thread()) return true;
+    record_check(context,
+                 Result::failed(std::string{kind} +
+                                     " used from a child thread; use non-aborting checks in child threads"),
+                 kind, "test-thread-only assertion", file, line);
+    return false;
 }
 
 template <std::ranges::range R1, std::ranges::range R2>
@@ -278,6 +383,47 @@ inline std::string test_name(const TestCase& test_case)
         return std::string{test_case.suite} + "/" + test_case.name;
     }
     return test_case.name;
+}
+
+/** Result of running one registered test case. */
+struct CaseResult {
+    const char* name;
+    TestStats stats;
+    std::optional<std::string> exception_message;
+};
+
+/** Run the test body. REQUIRE failures are expected control flow; other exceptions fail the case. */
+inline std::optional<std::string> invoke_test_case(const TestCase& test_case)
+{
+    try {
+        test_case.fn();
+    } catch (const RequireFailed&) {
+    } catch (const std::exception& e) {
+        return e.what();
+    } catch (...) {
+        return "unknown exception";
+    }
+    return std::nullopt;
+}
+
+inline CaseResult run_test_case(const TestCase& test_case)
+{
+    TestStats stats{};
+    std::optional<std::string> exception_message;
+    try {
+        TestContext context{test_name(test_case)};
+        exception_message = invoke_test_case(test_case);
+        stats = context.snapshot();
+    } catch (const std::exception& e) {
+        exception_message = e.what();
+    } catch (...) {
+        exception_message = "unknown exception";
+    }
+    return CaseResult{
+        .name = test_case.name,
+        .stats = stats,
+        .exception_message = std::move(exception_message),
+    };
 }
 
 inline bool matches_filter(const TestCase& tc, std::string_view filter)
@@ -420,29 +566,21 @@ inline int run(int argc, char** argv)
             ++summary.skipped;
             continue;
         }
-        current_stats() = {};
-        current_test_full_name() = test_name(test_case);
-        try {
-            test_case.fn();
-        } catch (const RequireFailed&) {
-        } catch (const std::exception& e) {
-            ++summary.failed;
-            log(LogLevel::Error, "EXCEPTION in %s: %s\n", test_case.name, e.what());
-            continue;
-        } catch (...) {
-            ++summary.failed;
-            log(LogLevel::Error, "EXCEPTION in %s: %s\n", test_case.name, "unknown exception");
-            continue;
-        }
-        const auto stats = current_stats();
+        const auto outcome{run_test_case(test_case)};
+        const auto stats = outcome.stats;
         summary.total_checks += stats.checks;
-        if (stats.failed_checks == 0) {
+        if (outcome.exception_message.has_value()) {
+            ++summary.failed;
+            log(LogLevel::Error, "EXCEPTION in %s: %s\n", outcome.name, *outcome.exception_message);
+            log(LogLevel::Error, "[FAIL] %s (exception after %d checks, %d checks failed)\n",
+                outcome.name, stats.checks, stats.failed_checks);
+        } else if (stats.failed_checks == 0) {
             ++summary.passed;
-            log(LogLevel::Info, "[ OK ] %s (%d checks)\n", test_case.name, stats.checks);
+            log(LogLevel::Info, "[ OK ] %s (%d checks)\n", outcome.name, stats.checks);
         } else {
             ++summary.failed;
             log(LogLevel::Error, "[FAIL] %s (%d/%d checks failed)\n",
-                test_case.name, stats.failed_checks, stats.checks);
+                outcome.name, stats.failed_checks, stats.checks);
         }
     }
     const int total_tests = summary.passed + summary.failed + summary.skipped;
@@ -540,27 +678,33 @@ inline int run(int argc, char** argv)
  * Example: CHECK(a == b, "context: a=" << a << " b=" << b); */
 #define CHECK(expr, ...)                                                                       \
     do {                                                                                       \
+        auto& btc_test_context_ = ::framework::current_test_context();                         \
         BITCOIN_TEST_DIAG_PUSH                                                                 \
-        ::framework::Result btc_test_res_ = ::framework::Decomposer{} <= expr;                 \
+        ::framework::Result btc_test_res_ = ::framework::Decomposer{} <= expr;                  \
         BITCOIN_TEST_DIAG_POP                                                                  \
         std::ostringstream btc_test_os_;                                                       \
         __VA_OPT__(if (!btc_test_res_.is_ok()) btc_test_os_ << __VA_ARGS__;)                   \
-        ::framework::record_check(btc_test_res_, "CHECK", #expr, __FILE__, __LINE__,           \
+        ::framework::record_check(btc_test_context_, btc_test_res_, "CHECK", #expr, __FILE__, __LINE__, \
                                   btc_test_res_.is_ok() ? std::string{} : btc_test_os_.str()); \
     } while (false)
 
-/** Like CHECK, but aborts the current test on failure by throwing.
- * Subsequent checks in the test are skipped.
+/** Like CHECK, but aborts the current test's control flow on failure by throwing.
+ * Subsequent checks in that control flow are skipped. Use CHECK from child
+ * threads, because throwing in a child thread cannot abort the parent test.
  *
  * Accepts the same optional stream-style failure message as CHECK. */
 #define REQUIRE(expr, ...)                                                                     \
     do {                                                                                       \
+        if (!::framework::aborting_check_allowed("REQUIRE", __FILE__, __LINE__)) {             \
+            break;                                                                             \
+        }                                                                                      \
+        auto& btc_test_context_ = ::framework::current_test_context();                         \
         BITCOIN_TEST_DIAG_PUSH                                                                 \
-        ::framework::Result btc_test_res_ = ::framework::Decomposer{} <= expr;                 \
+        ::framework::Result btc_test_res_ = ::framework::Decomposer{} <= expr;                  \
         BITCOIN_TEST_DIAG_POP                                                                  \
         std::ostringstream btc_test_os_;                                                       \
         __VA_OPT__(if (!btc_test_res_.is_ok()) btc_test_os_ << __VA_ARGS__;)                   \
-        ::framework::record_check(btc_test_res_, "REQUIRE", #expr, __FILE__, __LINE__,         \
+        ::framework::record_check(btc_test_context_, btc_test_res_, "REQUIRE", #expr, __FILE__, __LINE__, \
                                   btc_test_res_.is_ok() ? std::string{} : btc_test_os_.str()); \
         if (!btc_test_res_.is_ok()) throw ::framework::RequireFailed{};                        \
     } while (false)
@@ -568,6 +712,7 @@ inline int run(int argc, char** argv)
 /** Passes if `expr` throws any exception. */
 #define CHECK_THROWS(expr)                                               \
     do {                                                                 \
+        auto& btc_test_context_ = ::framework::current_test_context();    \
         ::framework::Result btc_test_res_ = ::framework::Result::failed( \
             "expression did not throw");                                 \
         try {                                                            \
@@ -575,33 +720,39 @@ inline int run(int argc, char** argv)
         } catch (...) {                                                  \
             btc_test_res_ = ::framework::Result::ok();                   \
         }                                                                \
-        ::framework::record_check(btc_test_res_, "CHECK_THROWS",         \
+        ::framework::record_check(btc_test_context_, btc_test_res_, "CHECK_THROWS", \
                                   #expr, __FILE__, __LINE__);            \
     } while (false)
 
 /** Passes if `expr` does NOT throw any exception. */
 #define CHECK_NOTHROW(expr)                                                    \
     do {                                                                       \
+        auto& btc_test_context_ = ::framework::current_test_context();          \
         ::framework::Result btc_test_res_ = ::framework::Result::ok();         \
         try {                                                                  \
             expr;                                                              \
         } catch (...) {                                                        \
             btc_test_res_ = ::framework::Result::failed("unexpectedly threw"); \
         }                                                                      \
-        ::framework::record_check(btc_test_res_, "CHECK_NOTHROW",              \
+        ::framework::record_check(btc_test_context_, btc_test_res_, "CHECK_NOTHROW", \
                                   #expr, __FILE__, __LINE__);                  \
     } while (false)
 
-/** Like CHECK_NOTHROW, but aborts the current test on failure. */
+/** Like CHECK_NOTHROW, but aborts the current test's control flow on failure. */
 #define REQUIRE_NOTHROW(expr)                                                  \
     do {                                                                       \
+        if (!::framework::aborting_check_allowed("REQUIRE_NOTHROW", __FILE__,  \
+                                                 __LINE__)) {                  \
+            break;                                                             \
+        }                                                                      \
+        auto& btc_test_context_ = ::framework::current_test_context();          \
         ::framework::Result btc_test_res_ = ::framework::Result::ok();         \
         try {                                                                  \
             expr;                                                              \
         } catch (...) {                                                        \
             btc_test_res_ = ::framework::Result::failed("unexpectedly threw"); \
         }                                                                      \
-        ::framework::record_check(btc_test_res_, "REQUIRE_NOTHROW",            \
+        ::framework::record_check(btc_test_context_, btc_test_res_, "REQUIRE_NOTHROW", \
                                   #expr, __FILE__, __LINE__);                  \
         if (!btc_test_res_.is_ok()) throw ::framework::RequireFailed{};        \
     } while (false)
@@ -609,6 +760,7 @@ inline int run(int argc, char** argv)
 /** Passes only if `expr` throws an exception derived from `ExceptionType`. */
 #define CHECK_THROWS_AS(expr, ExceptionType)                                                \
     do {                                                                                    \
+        auto& btc_test_context_ = ::framework::current_test_context();                       \
         ::framework::Result btc_test_res_ = ::framework::Result::failed(                    \
             "expression did not throw");                                                    \
         try {                                                                               \
@@ -618,7 +770,7 @@ inline int run(int argc, char** argv)
         } catch (...) {                                                                     \
             btc_test_res_ = ::framework::Result::failed("threw unexpected exception type"); \
         }                                                                                   \
-        ::framework::record_check(btc_test_res_, "CHECK_THROWS_AS",                         \
+        ::framework::record_check(btc_test_context_, btc_test_res_, "CHECK_THROWS_AS",      \
                                   #expr, __FILE__, __LINE__);                               \
     } while (false)
 
@@ -629,28 +781,31 @@ inline int run(int argc, char** argv)
  * Example:
  *   CHECK_EXCEPTION(parse(input), ParseError,
  *                   [](const ParseError& e) { return e.line == 3; }); */
-#define CHECK_EXCEPTION(expr, ExceptionType, Predicate)                                                                                      \
-    do {                                                                                                                                     \
-        ::framework::Result btc_test_res_ = ::framework::Result::failed(                                                                     \
-            "expression did not throw expected type");                                                                                       \
-        try {                                                                                                                                \
-            expr;                                                                                                                            \
-        } catch (ExceptionType const& e) {                                                                                                   \
-            btc_test_res_ = Predicate(e) ? ::framework::Result::ok() : ::framework::Result::failed("threw expected type, predicate failed"); \
-        } catch (...) {                                                                                                                      \
-            btc_test_res_ = ::framework::Result::failed(                                                                                     \
-                "threw unexpected exception type");                                                                                          \
-        }                                                                                                                                    \
-        ::framework::record_check(btc_test_res_, "CHECK_EXCEPTION",                                                                          \
-                                  #expr, __FILE__, __LINE__);                                                                                \
+#define CHECK_EXCEPTION(expr, ExceptionType, Predicate)                                               \
+    do {                                                                                              \
+        auto& btc_test_context_ = ::framework::current_test_context();                                 \
+        ::framework::Result btc_test_res_ = ::framework::Result::failed(                    \
+            "expression did not throw expected type");                                                \
+        try {                                                                                         \
+            expr;                                                                                     \
+        } catch (ExceptionType const& e) {                                                            \
+            btc_test_res_ = Predicate(e)                                                              \
+                ? ::framework::Result::ok()                                                          \
+                : ::framework::Result::failed("threw expected type, predicate failed");              \
+        } catch (...) {                                                                               \
+            btc_test_res_ = ::framework::Result::failed("threw unexpected exception type");          \
+        }                                                                                             \
+        ::framework::record_check(btc_test_context_, btc_test_res_, "CHECK_EXCEPTION",               \
+                                  #expr, __FILE__, __LINE__);                                         \
     } while (false)
 
 /** Passes if two ranges contain equal elements. Accepts any two types that
  * satisfy std::ranges::range with comparable element types. */
 #define CHECK_EQUAL_RANGES(a, b)                                                       \
     do {                                                                               \
+        auto& btc_test_context_ = ::framework::current_test_context();                  \
         ::framework::Result btc_test_res_ = ::framework::check_equal_ranges((a), (b)); \
-        ::framework::record_check(btc_test_res_, "CHECK_EQUAL_RANGES",                 \
+        ::framework::record_check(btc_test_context_, btc_test_res_, "CHECK_EQUAL_RANGES", \
                                   #a " == " #b, __FILE__, __LINE__);                   \
     } while (false)
 
