@@ -1,0 +1,46 @@
+name: Ironworks Spark
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "**"
+    tags-ignore:
+      - "**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  spark:
+    name: Spark
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          path: source
+
+      - name: Checkout Ironworks
+        uses: actions/checkout@v6
+        with:
+          repository: 2140-dev/ironworks
+          path: ironworks
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-substituters = https://2140-dev.cachix.org
+            extra-trusted-public-keys = 2140-dev.cachix.org-1:0brdoxVmXjL5udKuI+vXXwdEjPInGQKjCiyJLReZBt8=
+
+      - name: Run correctness
+        run: |
+          cd ironworks
+          nix build .#checks.x86_64-linux.correctness \
+            --override-input node path:${{ github.workspace }}/source \
+            --print-build-logs
