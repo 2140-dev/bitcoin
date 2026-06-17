@@ -23,7 +23,7 @@ and tests weren't explicitly disabled.
 The unit tests can be run with `ctest --test-dir build`, which includes unit
 tests from subtrees.
 
-Run `build/bin/test_bitcoin --list` for the full list of tests.
+Run `build/bin/test_bitcoin --list_content` for the full list of tests.
 
 To run the unit tests manually, launch `build/bin/test_bitcoin`. To recompile
 after a test file was modified, run `cmake --build build` and then run the test again. If you
@@ -57,7 +57,7 @@ build/bin/test_bitcoin -l all -t getarg_tests
 or to run only the `doubledash` test in `getarg_tests`
 
 ```bash
-build/bin/test_bitcoin --run_test=getarg_tests::doubledash
+build/bin/test_bitcoin --run_test=getarg_tests/doubledash
 ```
 
 The `--log_level=` (or `-l`) argument controls the verbosity of the test output.
