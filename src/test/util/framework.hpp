@@ -155,7 +155,7 @@ class TestContext
 private:
     std::atomic<int> m_checks{0};
     std::atomic<int> m_failed{0};
-    bool m_did_throw{false};
+    std::atomic<bool> m_did_throw{false};
     const std::string m_full_name;
     const std::thread::id m_owner_thread{std::this_thread::get_id()};
 
@@ -185,12 +185,12 @@ public:
 
     void exception_occured()
     {
-        m_did_throw = true;
+        m_did_throw.store(true, std::memory_order_relaxed);
     }
 
-    bool did_fail()
+    bool passed()
     {
-        return m_did_throw || m_failed.load(std::memory_order_relaxed) > 0;
+        return !m_did_throw.load(std::memory_order_relaxed) || m_failed.load(std::memory_order_relaxed) == 0;
     }
 
     TestStats stats() const noexcept
@@ -514,7 +514,7 @@ inline int run(int argc, char** argv)
         }
         const auto stats = ctx.stats();
         summary.total_checks += stats.checks;
-        if (!ctx.did_fail()) {
+        if (ctx.passed()) {
             ++summary.passed;
             log(LogLevel::Info, "[ OK ] %s (%d checks)\n", test_case.name, stats.checks);
         } else {
